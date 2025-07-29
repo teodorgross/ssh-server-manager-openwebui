@@ -163,109 +163,28 @@ class Pipe:
         except Exception as e:
             print(f"Error syncing servers to database: {e}")
 
-    def check_for_updates(self, force_check: bool = False) -> Optional[Dict[str, Any]]:
-        """Check for new version on GitHub"""
-        if not self.valves.ENABLE_UPDATE_CHECK and not force_check:
-            return None
-
-        if not HTTP_AVAILABLE:
-            return {
-                "update_available": False,
-                "error": "HTTP requests not available",
-                "current_version": self.current_version,
-                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-        # Always check on initialization, but respect minimum interval to avoid spam
-        now = datetime.now()
-        should_check = (
-            force_check
-            or not self.last_update_check
-            or now - self.last_update_check >= timedelta(minutes=5)
-        )  # Minimum 5 minutes between checks
-
-        if not should_check and self.latest_version_info:
-            return self.latest_version_info
-
-        try:
-            print("DEBUG: Checking for updates...")
-            response = requests.get(self.version_check_url, timeout=5)
-            response.raise_for_status()
-
-            latest_version = response.text.strip()
-            self.last_update_check = now
-
-            # Compare versions
-            if self.is_newer_version(latest_version, self.current_version):
-                self.latest_version_info = {
-                    "update_available": True,
-                    "latest_version": latest_version,
-                    "current_version": self.current_version,
-                    "download_url": self.github_url,
-                    "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                print(f"DEBUG: Update available: {latest_version}")
-            else:
-                self.latest_version_info = {
-                    "update_available": False,
-                    "latest_version": latest_version,
-                    "current_version": self.current_version,
-                    "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                print(
-                    f"DEBUG: No update needed. Current: {self.current_version}, Latest: {latest_version}"
-                )
-
-            return self.latest_version_info
-
-        except requests.exceptions.ConnectionError:
-            error_info = {
-                "update_available": False,
-                "error": "No internet connection",
-                "current_version": self.current_version,
-                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            print("DEBUG: Update check failed - No internet connection")
-            return error_info
-        except requests.exceptions.Timeout:
-            error_info = {
-                "update_available": False,
-                "error": "Connection timeout",
-                "current_version": self.current_version,
-                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            print("DEBUG: Update check failed - Timeout")
-            return error_info
-        except requests.exceptions.HTTPError as e:
-            error_info = {
-                "update_available": False,
-                "error": f"Server error: {e.response.status_code}",
-                "current_version": self.current_version,
-                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            print(f"DEBUG: Update check failed - HTTP {e.response.status_code}")
-            return error_info
-        except Exception as e:
-            error_info = {
-                "update_available": False,
-                "error": f"Check failed: {str(e)}",
-                "current_version": self.current_version,
-                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            print(f"DEBUG: Update check failed: {e}")
-            return error_info
-
     def is_newer_version(self, latest: str, current: str) -> bool:
         """Compare version strings (supports X.Y format)"""
         try:
 
             def version_tuple(v):
-                return tuple(map(int, v.split(".")))
+                # Remove any whitespace and split by dots
+                clean_v = v.strip()
+                return tuple(map(int, clean_v.split(".")))
 
-            return version_tuple(latest) > version_tuple(current)
-        except:
+            latest_tuple = version_tuple(latest)
+            current_tuple = version_tuple(current)
+
+            print(
+                f"DEBUG: Comparing versions - Latest: {latest_tuple}, Current: {current_tuple}"
+            )
+            return latest_tuple > current_tuple
+
+        except Exception as e:
+            print(f"DEBUG: Version comparison error: {e}")
+            print(f"DEBUG: Latest: '{latest}', Current: '{current}'")
             # Fallback to string comparison
-            return latest != current
+            return latest.strip() != current.strip()
 
     def get_update_notification(self) -> str:
         """Get update notification message"""
@@ -339,6 +258,79 @@ class Pipe:
             conn.close()
         except Exception as e:
             print(f"Database init error: {e}")
+
+    def check_for_updates(self, force_check: bool = False) -> Optional[Dict[str, Any]]:
+        """Check for new version on GitHub"""
+        try:
+            if not self.valves.ENABLE_UPDATE_CHECK and not force_check:
+                return None
+
+            if not HTTP_AVAILABLE:
+                return {
+                    "update_available": False,
+                    "error": "HTTP requests not available",
+                    "current_version": self.current_version,
+                    "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+            now = datetime.now()
+            should_check = (
+                force_check
+                or not self.last_update_check
+                or now - self.last_update_check >= timedelta(minutes=5)
+            )
+
+            if not should_check and self.latest_version_info:
+                return self.latest_version_info
+
+            try:
+                print("DEBUG: Checking for updates...")
+                response = requests.get(self.version_check_url, timeout=5)
+                response.raise_for_status()
+
+                latest_version = response.text.strip()
+                self.last_update_check = now
+
+                if self.is_newer_version(latest_version, self.current_version):
+                    self.latest_version_info = {
+                        "update_available": True,
+                        "latest_version": latest_version,
+                        "current_version": self.current_version,
+                        "download_url": self.github_url,
+                        "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                else:
+                    self.latest_version_info = {
+                        "update_available": False,
+                        "latest_version": latest_version,
+                        "current_version": self.current_version,
+                        "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+
+                return self.latest_version_info
+
+            except requests.exceptions.ConnectionError:
+                return {
+                    "update_available": False,
+                    "error": "No internet connection",
+                    "current_version": self.current_version,
+                    "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            except Exception as e:
+                return {
+                    "update_available": False,
+                    "error": f"Check failed: {str(e)}",
+                    "current_version": self.current_version,
+                    "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+        except Exception as e:
+            return {
+                "update_available": False,
+                "error": f"Critical error: {str(e)}",
+                "current_version": self.current_version,
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
 
     def encrypt_password(self, password: str, server_id: str) -> str:
         """Simple password encryption"""
@@ -1873,8 +1865,6 @@ Check the repository for changelog and new features!
 📦 **Current Version:** {update_info['current_version']}
 📅 **Last Checked:** {update_info['checked_at']}
 
-🔍 **Automatic checks:** Every {self.valves.UPDATE_CHECK_INTERVAL} hours
-⚙️ **Settings:** Update checks can be disabled in Valves
 
 **GitHub:** {self.github_url}"""
 
@@ -1943,7 +1933,7 @@ Edit the **SERVERS** setting in the valves and add your server configurations.
 
         welcome_message = f"""{update_notification}
 
-<sub>GitHub: https://github.com/teodorgross/ssh-server-manager-openwebui | Support: https://ko-fi.com/teodorgross | Version: {self.current_version}</sub>
+GitHub: https://github.com/teodorgross/ssh-server-manager-openwebui | Support: https://ko-fi.com/teodorgross | Version: {self.current_version}
 
 ---"""
 
