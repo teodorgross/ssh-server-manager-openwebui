@@ -2,7 +2,7 @@
 title: 🔧 SSH Server Agent
 author: Teodor Gross
 description: AI-powered SSH server management with interactive sessions
-version: 1.3
+version: 1.3.2
 requirements: paramiko, requests
 Github: https://github.com/teodorgross/ssh-server-manager-openwebui
 """
@@ -102,7 +102,7 @@ class Pipe:
         self.command_threads = {}  # Track running command threads
         self.thread_pool = ThreadPoolExecutor(max_workers=5)
         self.stop_flags = {}  # Flags to signal thread termination
-        self.current_version = "1.3"  # Current version
+        self.current_version = "1.3.2"  # Current version
         self.version_check_url = "https://raw.githubusercontent.com/teodorgross/ssh-server-manager-openwebui/refs/heads/main/version"
         self.github_url = "https://github.com/teodorgross/ssh-server-manager-openwebui"
         self.last_update_check = None
@@ -127,38 +127,36 @@ class Pipe:
             self.server_configs = []
 
     def sync_servers_to_database(self):
-        """Sync server configurations from valves to database"""
+        """Sync server configurations"""
         try:
             conn = sqlite3.connect(self.db_file)
 
             # Clear existing servers
             conn.execute("DELETE FROM servers")
 
-            # Insert servers from valves
+            # Insert servers WITHOUT passwords
             for server in self.server_configs:
                 server_id = server["name"].lower().replace(" ", "_").replace("-", "_")
-                encrypted_password = self.encrypt_password(
-                    server["password"], server_id
-                )
 
                 conn.execute(
                     """INSERT INTO servers 
-                       (id, name, host, username, model, password_hash, port) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (id, name, host, username, model, port) 
+                       VALUES (?, ?, ?, ?, ?, ?)""",
                     (
                         server_id,
                         server["name"],
                         server["host"],
                         server["username"],
                         server["model"],
-                        encrypted_password,
                         server.get("port", 22),
                     ),
                 )
 
             conn.commit()
             conn.close()
-            print(f"Synced {len(self.server_configs)} servers to database")
+            print(
+                f"Synced {len(self.server_configs)} servers to database (passwords excluded for security)"
+            )
 
         except Exception as e:
             print(f"Error syncing servers to database: {e}")
@@ -225,6 +223,44 @@ class Pipe:
         """Initialize SQLite database"""
         try:
             conn = sqlite3.connect(self.db_file)
+
+            try:
+                cursor = conn.execute("PRAGMA table_info(servers)")
+                columns = [row[1] for row in cursor.fetchall()]
+
+                if "password_hash" in columns:
+                    print("Migrating database: removing password_hash column...")
+
+                    conn.execute(
+                        """
+                        CREATE TABLE servers_new (
+                            id TEXT PRIMARY KEY,
+                            name TEXT UNIQUE,
+                            host TEXT,
+                            username TEXT,
+                            model TEXT,
+                            port INTEGER DEFAULT 22,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_used TIMESTAMP
+                        )
+                    """
+                    )
+
+                    conn.execute(
+                        """
+                        INSERT INTO servers_new (id, name, host, username, model, port, created_at, last_used)
+                        SELECT id, name, host, username, model, port, created_at, last_used
+                        FROM servers
+                    """
+                    )
+
+                    conn.execute("DROP TABLE servers")
+                    conn.execute("ALTER TABLE servers_new RENAME TO servers")
+                    print("Database migration completed: passwords removed")
+
+            except Exception as e:
+                print(f"Migration note: {e}")
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS servers (
@@ -233,7 +269,6 @@ class Pipe:
                     host TEXT,
                     username TEXT,
                     model TEXT,
-                    password_hash TEXT,
                     port INTEGER DEFAULT 22,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_used TIMESTAMP
@@ -256,6 +291,7 @@ class Pipe:
             )
             conn.commit()
             conn.close()
+
         except Exception as e:
             print(f"Database init error: {e}")
 
@@ -332,17 +368,24 @@ class Pipe:
                 "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-    def encrypt_password(self, password: str, server_id: str) -> str:
-        """Simple password encryption"""
-        encoded = base64.b64encode(password.encode()).decode()
-        return encoded
-
-    def decrypt_password(self, encrypted: str, server_id: str) -> str:
-        """Decrypt password"""
+    def get_server_password_from_valves(self, server_name: str) -> Optional[str]:
         try:
-            return base64.b64decode(encrypted.encode()).decode()
-        except:
-            return ""
+            self.load_server_configs()
+
+            for server in self.server_configs:
+                if (
+                    server["name"] == server_name
+                    or server["name"].lower().replace(" ", "_") == server_name.lower()
+                    or server["name"].lower().replace("-", "_") == server_name.lower()
+                ):
+                    return server["password"]
+
+            print(f"Password not found in valves for server: {server_name}")
+            return None
+
+        except Exception as e:
+            print(f"Error getting password from valves: {e}")
+            return None
 
     def pipes(self):
 
@@ -1630,7 +1673,7 @@ class Pipe:
             pass
 
     def get_server_info(self, model_id: str):
-        """Get server information from model ID"""
+        """Get server information from model ID - loads directly from valves"""
         print(f"DEBUG: get_server_info called with model_id: '{model_id}'")
 
         if not model_id.startswith("ssh."):
@@ -1640,12 +1683,35 @@ class Pipe:
         print(f"DEBUG: Looking for server_id: '{server_id}'")
 
         try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,))
-            server = cursor.fetchone()
-            conn.close()
-            print(f"DEBUG: Found server: {server}")
-            return server
+            # Load directly from valves instead of database
+            self.load_server_configs()
+
+            for server in self.server_configs:
+                # Match by name or generated ID
+                generated_id = (
+                    server["name"].lower().replace(" ", "_").replace("-", "_")
+                )
+
+                if (
+                    generated_id == server_id
+                    or server["name"].lower() == server_id.lower()
+                ):
+                    # Return tuple in expected format: (id, name, host, username, model, password_placeholder, port)
+                    server_tuple = (
+                        generated_id,  # server_id
+                        server["name"],  # name
+                        server["host"],  # host
+                        server["username"],  # username
+                        server["model"],  # model
+                        None,  # password_placeholder (not used anymore)
+                        server.get("port", 22),  # port
+                    )
+                    print(f"DEBUG: Found server from valves: {server_tuple}")
+                    return server_tuple
+
+            print(f"DEBUG: Server not found in valves for ID: {server_id}")
+            return None
+
         except Exception as e:
             print(f"DEBUG: Error in get_server_info: {e}")
             return None
@@ -1776,17 +1842,35 @@ class Pipe:
         return None
 
     def get_server_by_name(self, server_name: str) -> Optional[tuple]:
-        """Get server info by name"""
+        """Get server info by name - loads directly from valves"""
         try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.execute(
-                "SELECT * FROM servers WHERE name = ? OR id = ?",
-                (server_name, server_name),
-            )
-            server = cursor.fetchone()
-            conn.close()
-            return server
-        except:
+            self.load_server_configs()
+
+            for server in self.server_configs:
+                if (
+                    server["name"] == server_name
+                    or server["name"].lower().replace(" ", "_") == server_name.lower()
+                    or server["name"].lower().replace("-", "_") == server_name.lower()
+                ):
+                    generated_id = (
+                        server["name"].lower().replace(" ", "_").replace("-", "_")
+                    )
+
+                    # Return tuple in expected format
+                    return (
+                        generated_id,  # server_id
+                        server["name"],  # name
+                        server["host"],  # host
+                        server["username"],  # username
+                        server["model"],  # model
+                        None,  # password_placeholder
+                        server.get("port", 22),  # port
+                    )
+
+            return None
+
+        except Exception as e:
+            print(f"DEBUG: Error in get_server_by_name: {e}")
             return None
 
     def show_help(self) -> str:
@@ -2196,14 +2280,25 @@ Return ONLY the JSON, no other text."""
     def connect_to_server(self, server_info: tuple) -> str:
         """Auto-connect to server using valves configuration"""
         try:
-            server_id, name, host, username, model, password_hash = server_info[:6]
-            port = server_info[6] if len(server_info) > 6 else 22
+            server_id, name, host, username, model, password_placeholder, port = (
+                server_info[:7]
+            )
+            if len(server_info) < 7:
+                port = 22
 
-            # Decrypt password from database
-            password = self.decrypt_password(password_hash, server_id)
+            password = self.get_server_password_from_valves(name)
 
             if not password:
-                return f"❌ **No password available for {name}**\n\nPlease check the server configuration in the Valves."
+                return f"""❌ **No password available for {name}**
+
+🔐 **Security Note:** Passwords are loaded from Valves configuration only.
+
+**Please check:**
+1. Server '{name}' exists in Valves SERVERS configuration
+2. Password field is set correctly in the JSON
+3. Valves settings have been saved
+
+**Current Valves Config:** {len(self.server_configs)} servers configured"""
 
             # Test connection immediately
             result = self.execute_ssh_command(
@@ -2211,11 +2306,15 @@ Return ONLY the JSON, no other text."""
             )
 
             if result["success"]:
+                session_key = f"{server_id}_{username}_{host}"
+                self.session_passwords[session_key] = password
+
                 return f"""🟢 **Connected to {name}**
 
 📍 **Server:** {host}:{port}
 👤 **User:** {username}  
 🤖 **Model:** {model}
+🔐 **Security:** Password loaded from Valves (not stored in database)
 
 ## 🎯 **You can now use:**
 - **Natural language:** `install nginx`, `check disk space`
@@ -2226,7 +2325,17 @@ Return ONLY the JSON, no other text."""
 
 🔧 **Current Session:** You are now in server mode for {name}. All commands will be processed for this server."""
             else:
-                return f"❌ **Connection failed:** {result.get('error', 'Authentication failed')}\n\nPlease check the server configuration in the Valves."
+                return f"""❌ **Connection failed:** {result.get('error', 'Authentication failed')}
+
+🔐 **Security Check:** Password was loaded from Valves configuration.
+
+**Possible issues:**
+1. Wrong credentials in Valves configuration
+2. Network connectivity issues
+3. SSH service not running on target server
+4. Firewall blocking connection
+
+**Please verify the Valves configuration for server '{name}'."""
 
         except Exception as e:
             return f"❌ Connection error: {e}"
@@ -2443,11 +2552,11 @@ Type `/help` to see all available commands.
 
     def test_connection(self, server_info: tuple) -> str:
         """Test SSH connection"""
-        server_id, name, host, username, model, password_hash = server_info[:6]
+        server_id, name, host, username, model, password_placeholder = server_info[:6]
         session_key = f"{server_id}_{username}_{host}"
 
         if session_key not in self.session_passwords:
-            password = self.decrypt_password(password_hash, server_id)
+            password = self.get_server_password_from_valves(name)
         else:
             password = self.session_passwords[session_key]
 
