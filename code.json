@@ -2,7 +2,7 @@
 title: 🔧 SSH Server Agent
 author: Teodor Gross
 description: AI-powered SSH server management with interactive sessions
-version: 1.0
+version: 1.1
 requirements: paramiko, requests
 Github: https://github.com/teodorgross/ssh-server-manager-openwebui
 """
@@ -12,9 +12,14 @@ import json
 import re
 import hashlib
 import base64
+import threading
+import queue
+import signal
+import os
 from datetime import datetime
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 # Try import dependencies
 try:
@@ -49,9 +54,18 @@ class Pipe:
         SSH_TIMEOUT: int = Field(
             default=15, description="SSH connection timeout in seconds"
         )
+        COMMAND_TIMEOUT: int = Field(
+            default=30, description="Maximum command execution time in seconds"
+        )
+        MAX_CONCURRENT_COMMANDS: int = Field(
+            default=3, description="Maximum concurrent SSH commands"
+        )
         AUTO_EXECUTE_HIGH_CONFIDENCE: bool = Field(
             default=False,
             description="Automatically execute high-confidence AI commands",
+        )
+        ENABLE_FORCE_CLEANUP: bool = Field(
+            default=True, description="Enable force cleanup of hanging sessions"
         )
         # Server Configurations
         SERVERS: str = Field(
@@ -82,6 +96,9 @@ class Pipe:
         self.active_sessions = {}
         self.last_interactive_command = {}  # Store interactive commands
         self.pending_interactive_sessions = {}  # Store active interactive sessions
+        self.command_threads = {}  # Track running command threads
+        self.thread_pool = ThreadPoolExecutor(max_workers=5)
+        self.stop_flags = {}  # Flags to signal thread termination
         self.init_database()
         self.session_passwords = {}
         self.server_configs = []
@@ -232,27 +249,99 @@ class Pipe:
         except Exception as e:
             return f"❌ Ollama API error: {e}"
 
-    def execute_ssh_command(
+    def execute_ssh_command_threaded(
         self,
         server_info: tuple,
         command: str,
         password: str = None,
         user_input: str = None,
+        timeout: int = None,
     ) -> Dict[str, Any]:
-        """Execute SSH command with improved interactive input handling"""
+        """
+        Non-blocking SSH command execution for OpenWebUI
+        Uses threading to prevent UI blocking
+        """
         if not SSH_AVAILABLE:
             return {"success": False, "error": "SSH not available - install paramiko"}
 
+        if timeout is None:
+            timeout = self.valves.COMMAND_TIMEOUT
+
+        server_id = server_info[0]
+        session_key = f"{server_id}_{server_info[3]}_{server_info[2]}"
+
+        # Create a stop flag for this command
+        stop_flag = threading.Event()
+        self.stop_flags[session_key] = stop_flag
+
+        # Use thread pool to execute command
+        try:
+            future = self.thread_pool.submit(
+                self._execute_ssh_command_worker,
+                server_info,
+                command,
+                password,
+                user_input,
+                stop_flag,
+            )
+
+            # Wait with timeout - this allows OpenWebUI to remain responsive
+            result = future.result(timeout=timeout)
+
+            # Clean up
+            if session_key in self.stop_flags:
+                del self.stop_flags[session_key]
+
+            return result
+
+        except FutureTimeoutError:
+            # Command timed out - try to stop gracefully
+            stop_flag.set()
+
+            # Force cleanup after short grace period
+            try:
+                future.result(timeout=2)  # Give 2 seconds for graceful shutdown
+            except:
+                pass
+
+            self._force_cleanup_session(session_key)
+
+            return {
+                "success": False,
+                "error": f"Command timed out after {timeout} seconds. Connection may be unstable.",
+                "output": "Command was terminated due to timeout.",
+                "exit_code": -1,
+                "timeout": True,
+            }
+
+        except Exception as e:
+            if session_key in self.stop_flags:
+                del self.stop_flags[session_key]
+            return {"success": False, "error": f"Execution error: {e}", "exit_code": -1}
+
+    def _execute_ssh_command_worker(
+        self,
+        server_info: tuple,
+        command: str,
+        password: str,
+        user_input: str,
+        stop_flag: threading.Event,
+    ) -> Dict[str, Any]:
+        """
+        Worker function that runs in separate thread
+        Checks stop_flag regularly to allow graceful termination
+        """
         try:
             server_id, name, host, username, model = server_info[:5]
             port = server_info[6] if len(server_info) > 6 else 22
+            session_key = f"{server_id}_{username}_{host}"
 
             if not password:
                 return {"success": False, "error": "No password provided"}
-            ssh_password = password
 
-            # Create SSH connection
-            session_key = f"{server_id}_{username}_{host}"
+            # Check if we should stop before connecting
+            if stop_flag.is_set():
+                return {"success": False, "error": "Command cancelled"}
 
             # Check if we have a pending interactive session
             if (
@@ -260,34 +349,53 @@ class Pipe:
                 and user_input is not None
             ):
                 return self.continue_interactive_session(
-                    session_key, user_input, ssh_password
+                    session_key, user_input, password, stop_flag
                 )
 
+            # Handle existing connections
             if session_key in self.active_sessions:
                 client = self.active_sessions[session_key]
                 try:
-                    client.exec_command("echo test", timeout=5)
+                    # Quick connection test
+                    test_stdin, test_stdout, test_stderr = client.exec_command(
+                        "echo test", timeout=3
+                    )
+                    test_stdout.channel.settimeout(3.0)
+                    test_stdout.read()
                 except:
                     del self.active_sessions[session_key]
                     client = None
             else:
                 client = None
 
+            # Create new connection if needed
             if not client:
+                if stop_flag.is_set():
+                    return {"success": False, "error": "Command cancelled"}
+
                 client = paramiko.SSHClient()
                 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 client.connect(
                     hostname=host,
                     username=username,
-                    password=ssh_password,
+                    password=password,
                     port=port,
                     timeout=self.valves.SSH_TIMEOUT,
                 )
                 self.active_sessions[session_key] = client
-                self.session_passwords[session_key] = ssh_password
+                self.session_passwords[session_key] = password
 
-            # Execute command with PTY for full terminal experience
+            # Check stop flag before executing
+            if stop_flag.is_set():
+                return {"success": False, "error": "Command cancelled"}
+
+            # Execute command
             stdin, stdout, stderr = client.exec_command(command, get_pty=True)
+
+            # Set timeouts to prevent hanging
+            stdout.channel.settimeout(2.0)
+            stderr.channel.settimeout(2.0)
+            stdin.channel.settimeout(2.0)
 
             # Store the session for potential interactive continuation
             self.pending_interactive_sessions[session_key] = {
@@ -295,83 +403,104 @@ class Pipe:
                 "stdout": stdout,
                 "stderr": stderr,
                 "command": command,
-                "ssh_password": ssh_password,
+                "ssh_password": password,
             }
 
-            # If user provided input, send it immediately
+            # Handle user input
             if user_input is not None:
-                stdin.write(user_input + "\n")
-                stdin.flush()
+                try:
+                    stdin.write(user_input + "\n")
+                    stdin.flush()
+                except Exception as e:
+                    return {"success": False, "error": f"Failed to send input: {e}"}
 
-            # Simple approach: Wait for a reasonable time, then check if still running
+            # Read output with regular stop flag checks
             import time
 
             full_output = ""
-            password_filtered = False
-            wait_time = 0
-            max_wait = 12  # Increased wait time for sudo commands
+            error_output = ""
             sudo_password_sent = False
+            password_filtered = False
+            max_iterations = 100  # Prevent infinite loops
+            iteration = 0
 
-            # Read initial output quickly
-            while wait_time < max_wait:
-                if stdout.channel.recv_ready():
-                    chunk = stdout.channel.recv(4096).decode("utf-8", errors="ignore")
+            while iteration < max_iterations:
+                iteration += 1
 
-                    # Handle sudo password prompt automatically
-                    if not sudo_password_sent and "sudo" in command.lower():
-                        if any(
-                            indicator in chunk.lower()
-                            for indicator in ["[sudo]", "password for", "password:"]
-                        ):
-                            # Send the SSH password for sudo
-                            stdin.write(ssh_password + "\n")
-                            stdin.flush()
-                            sudo_password_sent = True
-
-                            # Continue reading after sending password
-                            time.sleep(0.5)
-                            continue
-
-                    # Handle sudo password filtering for display
-                    if not password_filtered and "sudo" in command.lower():
-                        if "[sudo]" in chunk or "password" in chunk.lower():
-                            lines = chunk.split("\n")
-                            filtered_chunk = ""
-                            skip_line = False
-
-                            for line in lines:
-                                if (
-                                    "[sudo]" in line.lower()
-                                    or "password for" in line.lower()
-                                    or ssh_password in line
-                                ):
-                                    skip_line = True
-                                    continue
-                                else:
-                                    if skip_line and line.strip():
-                                        skip_line = False
-                                    if not skip_line:
-                                        filtered_chunk += line + "\n"
-
-                            chunk = filtered_chunk
-                            password_filtered = True
-
-                    full_output += chunk
-                    wait_time = 0  # Reset wait time when we get output
+                # Check if we should stop
+                if stop_flag.is_set():
+                    self._terminate_command(stdin, stdout, stderr)
+                    return {
+                        "success": False,
+                        "error": "Command cancelled by user",
+                        "output": full_output,
+                    }
 
                 # Check if command finished
                 if stdout.channel.exit_status_ready():
-                    # Command completed, clean up interactive session
                     if session_key in self.pending_interactive_sessions:
                         del self.pending_interactive_sessions[session_key]
                     break
 
-                time.sleep(0.3)
-                wait_time += 0.3
+                # Try to read data (non-blocking)
+                try:
+                    if stdout.channel.recv_ready():
+                        chunk = stdout.channel.recv(4096).decode(
+                            "utf-8", errors="ignore"
+                        )
 
-            # If command is still running after timeout, it might be interactive
+                        # Handle sudo password
+                        if not sudo_password_sent and "sudo" in command.lower():
+                            if any(
+                                indicator in chunk.lower()
+                                for indicator in ["[sudo]", "password for", "password:"]
+                            ):
+                                try:
+                                    stdin.write(password + "\n")
+                                    stdin.flush()
+                                    sudo_password_sent = True
+                                    time.sleep(0.5)
+                                    continue
+                                except:
+                                    pass
+
+                        # Handle sudo password filtering for display
+                        if not password_filtered and "sudo" in command.lower():
+                            if "[sudo]" in chunk or "password" in chunk.lower():
+                                lines = chunk.split("\n")
+                                filtered_chunk = ""
+                                skip_line = False
+
+                                for line in lines:
+                                    if (
+                                        "[sudo]" in line.lower()
+                                        or "password for" in line.lower()
+                                        or password in line
+                                    ):
+                                        skip_line = True
+                                        continue
+                                    else:
+                                        if skip_line and line.strip():
+                                            skip_line = False
+                                        if not skip_line:
+                                            filtered_chunk += line + "\n"
+
+                                chunk = filtered_chunk
+                                password_filtered = True
+
+                        full_output += chunk
+
+                except Exception:
+                    pass  # Timeout or other non-fatal error
+
+                # Small sleep to prevent CPU spinning, but check stop flag frequently
+                for _ in range(3):  # 3 x 0.1 = 0.3 seconds total
+                    if stop_flag.is_set():
+                        break
+                    time.sleep(0.1)
+
+            # Check for interactive prompts
             if not stdout.channel.exit_status_ready():
-                # Check if this looks like an interactive prompt
                 if self.looks_like_interactive_prompt(full_output):
                     return {
                         "success": False,
@@ -383,41 +512,51 @@ class Pipe:
                         "session_key": session_key,
                     }
                 else:
-                    # Force kill the command and return what we have
+                    # Force terminate the command to prevent hanging
                     try:
-                        stdin.close()
+                        self._terminate_command(stdin, stdout, stderr)
                         if session_key in self.pending_interactive_sessions:
                             del self.pending_interactive_sessions[session_key]
-                    except:
+
+                        return {
+                            "success": False,
+                            "error": "Command timed out and was forcefully terminated",
+                            "output": full_output,
+                            "exit_code": -1,
+                            "timeout": True,
+                        }
+                    except Exception:
                         pass
 
-            # Get any remaining output
+            # Get remaining output and error (with timeout protection)
             try:
+                stdout.channel.settimeout(2.0)
                 remaining = stdout.read().decode("utf-8", errors="ignore")
                 if remaining and not any(
-                    skip in remaining for skip in [ssh_password, "[sudo]"]
+                    skip in remaining for skip in [password, "[sudo]"]
                 ):
                     full_output += remaining
             except:
                 pass
 
-            # Get stderr
-            error_output = ""
             try:
+                stderr.channel.settimeout(2.0)
                 stderr_content = stderr.read().decode("utf-8", errors="ignore")
                 if stderr_content:
                     if (
-                        ssh_password not in stderr_content
+                        password not in stderr_content
                         and "[sudo]" not in stderr_content.lower()
                     ):
                         error_output = stderr_content
             except:
                 pass
 
+            # Get exit code
             try:
+                stdout.channel.settimeout(2.0)
                 exit_code = stdout.channel.recv_exit_status()
             except:
-                exit_code = 0  # Assume success if we can't get exit code
+                exit_code = 0
 
             # Clean up completed session
             if session_key in self.pending_interactive_sessions:
@@ -427,7 +566,7 @@ class Pipe:
             self.update_server_usage(server_id)
 
             # Clean output but preserve formatting and progress indicators
-            clean_output = self.clean_but_preserve_formatting(full_output, ssh_password)
+            clean_output = self.clean_but_preserve_formatting(full_output, password)
 
             return {
                 "success": exit_code == 0,
@@ -453,8 +592,89 @@ class Pipe:
                 "exit_code": -1,
             }
 
+    def _terminate_command(self, stdin, stdout, stderr):
+        """Gracefully terminate a running command"""
+        try:
+            # Send Ctrl+C
+            stdin.write("\x03")
+            stdin.flush()
+            import time
+
+            time.sleep(0.5)
+
+            # Force close streams
+            stdin.close()
+            stdout.close()
+            stderr.close()
+        except:
+            pass
+
+    def _force_cleanup_session(self, session_key: str):
+        """Force cleanup of a session"""
+        try:
+            # Clean up pending interactive sessions
+            if session_key in self.pending_interactive_sessions:
+                session = self.pending_interactive_sessions[session_key]
+                try:
+                    self._terminate_command(
+                        session["stdin"], session["stdout"], session["stderr"]
+                    )
+                except:
+                    pass
+                del self.pending_interactive_sessions[session_key]
+
+            # Clean up active sessions
+            if session_key in self.active_sessions:
+                try:
+                    self.active_sessions[session_key].close()
+                except:
+                    pass
+                del self.active_sessions[session_key]
+
+            # Clean up session passwords
+            if session_key in self.session_passwords:
+                del self.session_passwords[session_key]
+
+        except Exception as e:
+            print(f"DEBUG: Force cleanup error: {e}")
+
+    def cleanup_all_sessions(self):
+        """Emergency cleanup - call this when OpenWebUI conversation is stopped"""
+        print("DEBUG: Cleaning up all SSH sessions...")
+
+        # Set all stop flags
+        for stop_flag in self.stop_flags.values():
+            stop_flag.set()
+
+        # Force cleanup all sessions
+        for session_key in list(self.active_sessions.keys()):
+            self._force_cleanup_session(session_key)
+
+        # Clear all tracking
+        self.stop_flags.clear()
+        self.active_sessions.clear()
+        self.session_passwords.clear()
+        self.pending_interactive_sessions.clear()
+        self.last_interactive_command.clear()
+
+    def execute_ssh_command(
+        self,
+        server_info: tuple,
+        command: str,
+        password: str = None,
+        user_input: str = None,
+    ) -> Dict[str, Any]:
+        """Execute SSH command - now uses threaded version"""
+        return self.execute_ssh_command_threaded(
+            server_info, command, password, user_input
+        )
+
     def continue_interactive_session(
-        self, session_key: str, user_input: str, ssh_password: str
+        self,
+        session_key: str,
+        user_input: str,
+        ssh_password: str,
+        stop_flag: threading.Event = None,
     ) -> Dict[str, Any]:
         """Continue an existing interactive session with user input"""
         if session_key not in self.pending_interactive_sessions:
@@ -479,6 +699,9 @@ class Pipe:
 
             # Read output after input
             while wait_time < max_wait:
+                if stop_flag and stop_flag.is_set():
+                    return {"success": False, "error": "Command cancelled"}
+
                 if stdout.channel.recv_ready():
                     chunk = stdout.channel.recv(4096).decode("utf-8", errors="ignore")
                     # Filter out password echoes
@@ -1425,6 +1648,7 @@ Type `/help` to see all available commands.
 
 ## ⚙️ **Configuration**
 - SSH Timeout: {self.valves.SSH_TIMEOUT}s
+- Command Timeout: {self.valves.COMMAND_TIMEOUT}s
 - Ollama URL: {self.valves.OLLAMA_BASE_URL}
 
 💡 **Ready for commands!**"""
@@ -1503,6 +1727,7 @@ Type `/help` to see all available commands.
 ## 🔗 **Connection**
 - **Status:** {connection_status}
 - **SSH Timeout:** {self.valves.SSH_TIMEOUT}s
+- **Command Timeout:** {self.valves.COMMAND_TIMEOUT}s
 
 ## 🤖 **AI Configuration**
 - **Model:** {model}
@@ -1734,3 +1959,11 @@ You are now back in **SSH Manager mode**. The chat context has been reset.
             response += f"\n💡 **To Execute:** `$ {execute_command}`\n🔧 **Or enable auto-execution in settings**"
 
         return response
+
+    def __del__(self):
+        """Cleanup when pipe is destroyed"""
+        try:
+            self.cleanup_all_sessions()
+            self.thread_pool.shutdown(wait=False)
+        except:
+            pass
