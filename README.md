@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Compatible-orange.svg)](https://github.com/open-webui/open-webui)
 
-Transform your server management experience with natural language commands, AI-powered assistance, and seamless SSH integration. Execute complex server tasks by simply asking in plain English!
+Transform your server management experience with natural language commands, AI-powered assistance, and seamless SSH integration. Execute complex server tasks by simply asking it!!
 
 ## ✨ Features
 
