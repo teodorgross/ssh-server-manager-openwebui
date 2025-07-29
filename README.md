@@ -8,6 +8,8 @@
 
 Transform your server management experience with natural language commands, AI-powered assistance, and seamless SSH integration. Execute complex server tasks by simply asking it!!
 
+![preview](preview.PNG)
+
 ## ✨ Features
 
 ### 🤖 **AI-Powered Commands**
