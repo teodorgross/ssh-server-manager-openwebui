@@ -2,7 +2,7 @@
 title: 🔧 SSH Server Agent
 author: Teodor Gross
 description: AI-powered SSH server management with interactive sessions
-version: 1.1
+version: 1.2
 requirements: paramiko, requests
 Github: https://github.com/teodorgross/ssh-server-manager-openwebui
 """
@@ -414,6 +414,42 @@ class Pipe:
                 except Exception as e:
                     return {"success": False, "error": f"Failed to send input: {e}"}
 
+            # SPECIAL HANDLING FOR IMMEDIATE INTERACTIVE COMMANDS
+            if self.is_immediate_interactive_command(command) and user_input is None:
+                import time
+
+                command_lower = command.lower().strip()
+
+                # Different wait times for different command types
+                if command_lower in ["passwd", "sudo passwd"]:
+                    time.sleep(0.3)  # Very short for passwd
+                elif any(
+                    cmd in command_lower
+                    for cmd in ["mysql", "psql", "sqlite3", "python", "node", "irb"]
+                ):
+                    time.sleep(0.5)  # Short for interpreters/databases
+                elif any(
+                    cmd in command_lower for cmd in ["nano", "vim", "vi", "emacs"]
+                ):
+                    time.sleep(0.4)  # Short for editors
+                else:
+                    time.sleep(0.6)  # Default for other interactive commands
+
+                # Check if command is still running (not finished)
+                if not stdout.channel.exit_status_ready():
+                    # Most interactive commands don't show output before waiting
+                    return {
+                        "success": False,
+                        "interaction_required": True,
+                        "output": self.get_interactive_startup_message(command),
+                        "prompt_hint": self.extract_prompt_hint_for_command(
+                            command, ""
+                        ),
+                        "command": command,
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "session_key": session_key,
+                    }
+
             # Read output with regular stop flag checks
             import time
 
@@ -501,12 +537,21 @@ class Pipe:
 
             # Check for interactive prompts
             if not stdout.channel.exit_status_ready():
-                if self.looks_like_interactive_prompt(full_output):
+                # Special case for commands that immediately wait for input
+                if self.is_immediate_interactive_command(
+                    command
+                ) or self.looks_like_interactive_prompt(full_output):
                     return {
                         "success": False,
                         "interaction_required": True,
-                        "output": full_output,
-                        "prompt_hint": self.extract_prompt_hint(full_output),
+                        "output": (
+                            full_output
+                            if full_output
+                            else f"Command '{command}' is waiting for input..."
+                        ),
+                        "prompt_hint": self.extract_prompt_hint_for_command(
+                            command, full_output
+                        ),
                         "command": command,
                         "timestamp": datetime.now().strftime("%H:%M:%S"),
                         "session_key": session_key,
@@ -664,10 +709,35 @@ class Pipe:
         password: str = None,
         user_input: str = None,
     ) -> Dict[str, Any]:
-        """Execute SSH command - now uses threaded version"""
-        return self.execute_ssh_command_threaded(
-            server_info, command, password, user_input
-        )
+        """Execute SSH command - uses threaded version with smart timeout handling"""
+        command_lower = command.lower().strip()
+
+        # Smart timeout based on command type
+        if self.is_immediate_interactive_command(command) and user_input is None:
+            # Interactive commands get shorter timeouts for faster detection
+            if command_lower in ["passwd", "sudo passwd"]:
+                timeout = 4  # Very short for passwd
+            elif any(cmd in command_lower for cmd in ["mysql", "psql", "sqlite3"]):
+                timeout = 6  # Short for databases
+            elif any(cmd in command_lower for cmd in ["python", "node", "irb"]):
+                timeout = 6  # Short for interpreters
+            elif any(cmd in command_lower for cmd in ["nano", "vim", "vi", "emacs"]):
+                timeout = 5  # Short for editors
+            else:
+                timeout = 8  # Default for other interactive
+
+            return self.execute_ssh_command_threaded(
+                server_info, command, password, user_input, timeout=timeout
+            )
+        else:
+            # Normal commands get full timeout
+            return self.execute_ssh_command_threaded(
+                server_info,
+                command,
+                password,
+                user_input,
+                timeout=self.valves.COMMAND_TIMEOUT,
+            )
 
     def continue_interactive_session(
         self,
@@ -795,6 +865,10 @@ class Pipe:
             "proceed?",
             "press",
             "type",
+            "new password:",
+            "retype new password:",
+            "current password:",
+            "changing password",
             ":",
             "?",
         ]
@@ -820,6 +894,515 @@ class Pipe:
             return "Expecting menu selection (number)"
         else:
             return f"Prompt: {last_line[-100:]}"  # Show last part of the prompt
+
+    def is_immediate_interactive_command(self, command: str) -> bool:
+        """Check if command immediately waits for input without output"""
+        immediate_interactive_commands = [
+            # Password/User Management
+            "passwd",
+            "chpasswd",
+            "usermod",
+            "adduser",
+            "useradd",
+            "userdel",
+            "su",
+            "sudo su",
+            "login",
+            "newgrp",
+            # Databases
+            "mysql",
+            "mysql -p",
+            "psql",
+            "sqlite3",
+            "mongodb",
+            "mongo",
+            "redis-cli",
+            "mariadb",
+            "cockroach",
+            "influx",
+            "cassandra",
+            "cqlsh",
+            # Programming Languages & REPLs
+            "python",
+            "python3",
+            "python2",
+            "ipython",
+            "ipython3",
+            "node",
+            "nodejs",
+            "deno",
+            "bun",
+            "ruby",
+            "irb",
+            "pry",
+            "php",
+            "php -a",
+            "perl",
+            "perl -de1",
+            "lua",
+            "luajit",
+            "julia",
+            "octave",
+            "matlab",
+            "scala",
+            "sbt",
+            "amm",
+            "clojure",
+            "lein repl",
+            "erlang",
+            "erl",
+            "elixir",
+            "iex",
+            "ghci",
+            "hugs",
+            "runhaskell",
+            "go run",
+            "gocomplete",
+            "rustc",
+            "cargo run",
+            # Text Editors
+            "nano",
+            "vim",
+            "vi",
+            "nvim",
+            "emacs",
+            "joe",
+            "micro",
+            "helix",
+            "pico",
+            "mcedit",
+            "ed",
+            "ex",
+            # File Viewers/Pagers
+            "less",
+            "more",
+            "most",
+            "bat",
+            "cat -n",
+            "nl",
+            "head -f",
+            "tail -f",
+            "watch",
+            # System Tools
+            "fdisk",
+            "cfdisk",
+            "parted",
+            "gparted",
+            "gdisk",
+            "mount",
+            "umount",
+            "fsck",
+            "mkfs",
+            "chroot",
+            "systemctl edit",
+            "visudo",
+            "vipw",
+            # Network & Remote
+            "ssh",
+            "scp",
+            "sftp",
+            "rsync",
+            "telnet",
+            "nc",
+            "netcat",
+            "ftp",
+            "lftp",
+            "curl -T",
+            "wget --post-data",
+            "openssl",
+            "gpg",
+            "ssh-keygen",
+            # Development Tools
+            "git rebase -i",
+            "git commit",
+            "git tag -a",
+            "git merge",
+            "docker exec -it",
+            "docker run -it",
+            "kubectl exec -it",
+            "screen",
+            "tmux",
+            "byobu",
+            "gdb",
+            "lldb",
+            "pdb",
+            "ipdb",
+            "npm init",
+            "yarn init",
+            "pip install -e",
+            # Package Managers (interactive modes)
+            "apt edit-sources",
+            "dpkg-reconfigure",
+            "debconf-set-selections",
+            "yum shell",
+            "dnf shell",
+            "zypper shell",
+            "pacman -S",
+            "makepkg",
+            "yay",
+            "paru",
+            # Configuration Tools
+            "raspi-config",
+            "nmtui",
+            "bluetoothctl",
+            "wpa_cli",
+            "alsamixer",
+            "nmcli connection edit",
+            "systemd-analyze",
+            "ufw",
+            "iptables-restore",
+            "fail2ban-client",
+            # Monitoring & Process Management
+            "top",
+            "htop",
+            "iotop",
+            "iftop",
+            "nethogs",
+            "nload",
+            "atop",
+            "glances",
+            "nmon",
+            "dstat",
+            "sar",
+            "kill -STOP",
+            "killall -STOP",
+            # File Management
+            "mc",
+            "ranger",
+            "nnn",
+            "lf",
+            "vifm",
+            "fff",
+            "find -exec",
+            "xargs -p",
+            "confirm",
+            # Archive & Compression
+            "tar -I",
+            "zip -r",
+            "unzip -l",
+            "7z a",
+            "rar a",
+            # Backup & Sync
+            "rsnapshot",
+            "duplicity",
+            "borg",
+            "restic",
+            "rclone config",
+            "rclone mount",
+            "syncthing",
+            # Security & Encryption
+            "openssl req",
+            "openssl ca",
+            "certbot",
+            "acme.sh",
+            "gpg --gen-key",
+            "ssh-copy-id",
+            "ssh-add",
+            # Virtualization
+            "virsh",
+            "virt-manager",
+            "vboxmanage",
+            "vagrant",
+            "lxc",
+            "podman run -it",
+            "nerdctl run -it",
+            # Build Systems
+            "make menuconfig",
+            "cmake -i",
+            "configure",
+            "autoconf",
+            "maven",
+            "mvn",
+            "gradle",
+            "ant",
+            "bazel",
+            # Cloud & DevOps
+            "ansible-playbook",
+            "terraform plan",
+            "helm install",
+            "kubectl apply",
+            "docker-compose up",
+            "vagrant up",
+            "aws configure",
+            "gcloud auth",
+            "az login",
+            # System Recovery & Maintenance
+            "fsck -i",
+            "badblocks",
+            "smartctl -t",
+            "memtest86+",
+            "rescue",
+            "recovery",
+            "chkdsk",
+            "scandisk",
+        ]
+
+        command_lower = command.lower().strip()
+
+        # Check for exact matches or command starts
+        for cmd in immediate_interactive_commands:
+            if command_lower == cmd or command_lower.startswith(cmd + " "):
+                return True
+
+        # Special patterns
+        if any(
+            pattern in command_lower
+            for pattern in [
+                "sudo passwd",
+                "sudo su",
+                "sudo -i",
+                "sudo -s",
+                "mysql -u",
+                "psql -U",
+                "sqlite3 ",
+                "python -i",
+                "python3 -i",
+                "node -i",
+                "vim +",
+                "nano +",
+                "emacs +",
+                "ssh -t",
+                "ssh -i",
+                "ssh -X",
+                "docker exec -it",
+                "kubectl exec -it",
+                "systemctl edit",
+                "git commit -m",
+                "openssl req -new",
+                "gpg --encrypt",
+            ]
+        ):
+            return True
+
+        return False
+
+    def get_interactive_startup_message(self, command: str) -> str:
+        """Get appropriate startup message for interactive commands"""
+        command_lower = command.lower().strip()
+
+        # Password & User Management
+        if any(cmd in command_lower for cmd in ["passwd", "chpasswd"]):
+            return "Password change initiated - enter current password"
+        elif any(cmd in command_lower for cmd in ["su", "sudo su", "login"]):
+            return "User switch initiated - enter password"
+        elif any(cmd in command_lower for cmd in ["adduser", "useradd", "usermod"]):
+            return "User management tool started - follow prompts"
+
+        # Databases
+        elif "mysql" in command_lower or "mariadb" in command_lower:
+            return "MySQL/MariaDB client started - ready for database connection"
+        elif "psql" in command_lower:
+            return "PostgreSQL client started - ready for database connection"
+        elif "sqlite3" in command_lower:
+            return "SQLite3 shell started - ready for SQL commands"
+        elif any(cmd in command_lower for cmd in ["mongo", "mongodb", "redis-cli"]):
+            return "Database client started - ready for commands"
+
+        # Programming Languages
+        elif any(cmd in command_lower for cmd in ["python", "ipython"]):
+            return "Python interpreter started - ready for Python commands"
+        elif command_lower in ["node", "nodejs", "deno", "bun"]:
+            return "JavaScript runtime started - ready for JavaScript commands"
+        elif any(cmd in command_lower for cmd in ["ruby", "irb", "pry"]):
+            return "Ruby interpreter started - ready for Ruby commands"
+        elif "php" in command_lower:
+            return "PHP interpreter started - ready for PHP commands"
+        elif any(
+            cmd in command_lower for cmd in ["julia", "octave", "matlab", "scala"]
+        ):
+            return "Mathematical/Scientific interpreter started - ready for commands"
+
+        # Text Editors
+        elif command_lower in ["nano", "pico", "micro"]:
+            return "Text editor opened - ready for editing"
+        elif any(cmd in command_lower for cmd in ["vim", "vi", "nvim"]):
+            return "Vim editor opened - press 'i' to insert, ':wq' to save and quit"
+        elif "emacs" in command_lower:
+            return "Emacs editor opened - Ctrl+X Ctrl+S to save, Ctrl+X Ctrl+C to quit"
+
+        # File Viewers & Pagers
+        elif any(cmd in command_lower for cmd in ["less", "more", "most"]):
+            return "File pager opened - use arrow keys to navigate, 'q' to quit"
+        elif any(cmd in command_lower for cmd in ["tail -f", "watch"]):
+            return "Live monitoring started - Ctrl+C to stop"
+
+        # System Tools
+        elif any(cmd in command_lower for cmd in ["fdisk", "cfdisk", "parted"]):
+            return "Disk partitioning tool started - be careful with changes!"
+        elif "fsck" in command_lower:
+            return "File system check started - follow prompts for repairs"
+        elif "visudo" in command_lower:
+            return "Sudo configuration editor opened - edit carefully!"
+
+        # Network & Remote
+        elif "ssh" in command_lower:
+            return "SSH connection initiated - may require authentication"
+        elif any(cmd in command_lower for cmd in ["telnet", "nc", "netcat"]):
+            return "Network connection established - ready for communication"
+        elif any(cmd in command_lower for cmd in ["ftp", "sftp", "lftp"]):
+            return "File transfer client started - ready for file operations"
+
+        # Development Tools
+        elif any(
+            cmd in command_lower for cmd in ["git commit", "git rebase", "git merge"]
+        ):
+            return "Git interactive operation started - follow prompts"
+        elif any(cmd in command_lower for cmd in ["docker exec", "kubectl exec"]):
+            return "Container shell started - ready for commands"
+        elif any(cmd in command_lower for cmd in ["screen", "tmux", "byobu"]):
+            return "Terminal multiplexer started - session management active"
+        elif any(cmd in command_lower for cmd in ["gdb", "lldb", "pdb"]):
+            return "Debugger started - ready for debugging commands"
+
+        # Configuration Tools
+        elif any(
+            cmd in command_lower for cmd in ["nmtui", "bluetoothctl", "alsamixer"]
+        ):
+            return "System configuration tool started - use interface to configure"
+        elif "raspi-config" in command_lower:
+            return "Raspberry Pi configuration tool started"
+
+        # Monitoring Tools
+        elif any(cmd in command_lower for cmd in ["top", "htop", "iotop", "glances"]):
+            return "System monitor started - real-time system information"
+        elif any(cmd in command_lower for cmd in ["iftop", "nethogs", "nload"]):
+            return "Network monitor started - real-time network information"
+
+        # File Managers
+        elif any(cmd in command_lower for cmd in ["mc", "ranger", "nnn", "vifm"]):
+            return "File manager started - navigate with arrow keys"
+
+        # Package Managers
+        elif any(
+            cmd in command_lower for cmd in ["apt edit-sources", "dpkg-reconfigure"]
+        ):
+            return "Package configuration tool started - follow prompts"
+        elif any(
+            cmd in command_lower for cmd in ["yum shell", "dnf shell", "zypper shell"]
+        ):
+            return "Package manager shell started - ready for package commands"
+
+        # Cloud & DevOps
+        elif any(
+            cmd in command_lower for cmd in ["aws configure", "gcloud auth", "az login"]
+        ):
+            return "Cloud authentication started - follow login prompts"
+        elif any(cmd in command_lower for cmd in ["terraform", "ansible", "helm"]):
+            return "Infrastructure tool started - ready for operations"
+
+        else:
+            return f"Interactive command '{command}' started - ready for input"
+
+    def extract_prompt_hint_for_command(self, command: str, output: str) -> str:
+        """Extract prompt hint based on command and output"""
+        command_lower = command.lower()
+
+        # Password & User Management
+        if "passwd" in command_lower:
+            if not output or "current" in output.lower():
+                return "Enter current password"
+            elif "new" in output.lower():
+                return "Enter new password"
+            elif "retype" in output.lower() or "confirm" in output.lower():
+                return "Confirm new password"
+            else:
+                return "Enter password"
+        elif any(cmd in command_lower for cmd in ["su", "sudo su", "login"]):
+            return "Enter password for user switch"
+
+        # Databases
+        elif "mysql" in command_lower or "mariadb" in command_lower:
+            return "Enter MySQL commands (try: SHOW DATABASES; USE database_name;)"
+        elif "psql" in command_lower:
+            return "Enter PostgreSQL commands (try: \\l for databases, \\q to quit)"
+        elif "sqlite3" in command_lower:
+            return "Enter SQLite commands (try: .tables .schema .quit)"
+        elif any(cmd in command_lower for cmd in ["mongo", "mongodb"]):
+            return "Enter MongoDB commands (try: show dbs, use database)"
+        elif "redis-cli" in command_lower:
+            return "Enter Redis commands (try: KEYS *, GET key, SET key value)"
+
+        # Programming Languages
+        elif any(cmd in command_lower for cmd in ["python", "ipython"]):
+            return "Enter Python code (try: print('hello'), help(), exit())"
+        elif any(cmd in command_lower for cmd in ["node", "nodejs", "deno"]):
+            return "Enter JavaScript code (try: console.log('hello'), .help, .exit)"
+        elif any(cmd in command_lower for cmd in ["ruby", "irb", "pry"]):
+            return "Enter Ruby code (try: puts 'hello', help, exit)"
+        elif "php" in command_lower:
+            return "Enter PHP code (try: echo 'hello'; exit;)"
+        elif any(cmd in command_lower for cmd in ["julia", "octave", "matlab"]):
+            return "Enter mathematical expressions or commands"
+
+        # Text Editors
+        elif command_lower in ["nano", "pico", "micro"]:
+            return "Edit text - Ctrl+X to exit, Ctrl+O to save"
+        elif any(cmd in command_lower for cmd in ["vim", "vi", "nvim"]):
+            return "Vim: 'i' for insert mode, 'Esc' for command mode, ':wq' to save+quit, ':q!' to quit without saving"
+        elif "emacs" in command_lower:
+            return (
+                "Emacs: Ctrl+X Ctrl+S to save, Ctrl+X Ctrl+C to quit, Ctrl+G to cancel"
+            )
+
+        # File Viewers & System Tools
+        elif any(cmd in command_lower for cmd in ["less", "more", "most"]):
+            return "Navigate: Arrow keys, Page Up/Down, 'q' to quit, '/' to search"
+        elif any(cmd in command_lower for cmd in ["top", "htop"]):
+            return "System monitor: 'q' to quit, 'k' to kill process, 'h' for help"
+        elif any(cmd in command_lower for cmd in ["fdisk", "cfdisk"]):
+            return (
+                "Disk tool: Use menu options carefully! 'w' writes changes, 'q' quits"
+            )
+        elif "fsck" in command_lower:
+            return "File system check: Answer 'y' to fix errors, 'n' to skip"
+
+        # Network & Remote
+        elif "ssh" in command_lower:
+            return (
+                "SSH: Enter password, accept host key (yes/no), or provide other auth"
+            )
+        elif any(cmd in command_lower for cmd in ["ftp", "sftp", "lftp"]):
+            return "FTP: Use commands like 'ls', 'cd', 'get', 'put', 'quit'"
+        elif any(cmd in command_lower for cmd in ["telnet", "nc", "netcat"]):
+            return "Network connection: Type commands or data to send"
+
+        # Development & Version Control
+        elif "git commit" in command_lower:
+            return "Git: Enter commit message, save and exit editor"
+        elif "git rebase" in command_lower:
+            return "Git rebase: Follow prompts, edit commits as needed"
+        elif any(cmd in command_lower for cmd in ["docker exec", "kubectl exec"]):
+            return "Container shell: Run commands inside container"
+        elif any(cmd in command_lower for cmd in ["gdb", "lldb"]):
+            return "Debugger: Try 'run', 'break main', 'continue', 'step', 'quit'"
+
+        # Package Management
+        elif "dpkg-reconfigure" in command_lower:
+            return "Package reconfiguration: Follow prompts to configure package"
+        elif any(cmd in command_lower for cmd in ["apt edit-sources", "visudo"]):
+            return "System configuration: Edit carefully and save"
+
+        # Configuration Tools
+        elif any(cmd in command_lower for cmd in ["nmtui", "bluetoothctl"]):
+            return "Configuration interface: Use arrow keys and Enter to navigate"
+        elif "alsamixer" in command_lower:
+            return (
+                "Audio mixer: Arrow keys to navigate, 'M' to mute/unmute, 'Esc' to exit"
+            )
+
+        # File Managers
+        elif any(cmd in command_lower for cmd in ["mc", "ranger", "nnn"]):
+            return "File manager: Arrow keys to navigate, Enter to open, Tab to switch panel"
+
+        # Cloud & DevOps
+        elif any(cmd in command_lower for cmd in ["aws configure", "gcloud auth"]):
+            return "Cloud setup: Enter credentials and configuration as prompted"
+        elif "terraform" in command_lower:
+            return "Terraform: Respond to prompts for infrastructure changes"
+
+        else:
+            # Fall back to output-based detection
+            return self.extract_prompt_hint(output)
 
     def clean_but_preserve_formatting(self, output: str, password: str) -> str:
         """Clean output but preserve progress bars, percentages, and formatting"""
