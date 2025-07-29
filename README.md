@@ -310,17 +310,6 @@ Each entry shows:
 - Try direct command: `$ killall command_name`
 - Check if command is waiting for specific input format
 
-## 📝 Changelog
-
-### v1.0.0 (Current)
-- ✨ Initial release
-- 🤖 AI-powered command generation
-- 🔌 Multi-server support via Valves
-- ⌨️ Interactive terminal support
-- 🛡️ Safety validation and command filtering
-- 📊 Command history and auditing
-- 🎯 Natural language processing
-
 
 
 ## 📄 License
