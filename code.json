@@ -104,7 +104,7 @@ class Pipe:
         self.stop_flags = {}  # Flags to signal thread termination
         self.current_version = "1.3"  # Current version
         self.version_check_url = "https://raw.githubusercontent.com/teodorgross/ssh-server-manager-openwebui/refs/heads/main/version"
-        self.openwebui_url = "https://openwebui.com/f/teodorgross/ssh_server_agent"
+        self.github_url = "https://github.com/teodorgross/ssh-server-manager-openwebui"
         self.last_update_check = None
         self.latest_version_info = None
         self.init_database()
@@ -176,12 +176,12 @@ class Pipe:
                 "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-        # For automatic checks on chat init, always check but respect cache for manual calls
+        # Always check on initialization, but respect minimum interval to avoid spam
         now = datetime.now()
         should_check = (
             force_check
             or not self.last_update_check
-            or now - self.last_update_check < timedelta(minutes=5)
+            or now - self.last_update_check >= timedelta(minutes=5)
         )  # Minimum 5 minutes between checks
 
         if not should_check and self.latest_version_info:
@@ -201,7 +201,7 @@ class Pipe:
                     "update_available": True,
                     "latest_version": latest_version,
                     "current_version": self.current_version,
-                    "download_url": self.openwebui_url,
+                    "download_url": self.github_url,
                     "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 print(f"DEBUG: Update available: {latest_version}")
@@ -1848,7 +1848,7 @@ class Pipe:
 - Ensure requests library is available
 
 **Current Version:** {self.current_version}
-**GitHub:** {self.openwebui_url}"""
+**GitHub:** {self.github_url}"""
 
         if update_info.get("update_available"):
             return f"""🚀 **UPDATE AVAILABLE!**
@@ -1876,7 +1876,7 @@ Check the repository for changelog and new features!
 🔍 **Automatic checks:** Every {self.valves.UPDATE_CHECK_INTERVAL} hours
 ⚙️ **Settings:** Update checks can be disabled in Valves
 
-**GitHub:** {self.openwebui_url}"""
+**GitHub:** {self.github_url}"""
 
     def list_servers(self) -> str:
         """List all configured servers from valves"""
@@ -1943,7 +1943,7 @@ Edit the **SERVERS** setting in the valves and add your server configurations.
 
         welcome_message = f"""{update_notification}
 
-GitHub: https://github.com/teodorgross/ssh-server-manager-openwebui | Support: https://ko-fi.com/teodorgross | Version: {self.current_version}
+<sub>GitHub: https://github.com/teodorgross/ssh-server-manager-openwebui | Support: https://ko-fi.com/teodorgross | Version: {self.current_version}</sub>
 
 ---"""
 
