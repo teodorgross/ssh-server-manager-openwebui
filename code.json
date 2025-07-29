@@ -2,7 +2,7 @@
 title: 🔧 SSH Server Agent
 author: Teodor Gross
 description: AI-powered SSH server management with interactive sessions
-version: 1.2
+version: 1.3
 requirements: paramiko, requests
 Github: https://github.com/teodorgross/ssh-server-manager-openwebui
 """
@@ -16,7 +16,7 @@ import threading
 import queue
 import signal
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -67,6 +67,9 @@ class Pipe:
         ENABLE_FORCE_CLEANUP: bool = Field(
             default=True, description="Enable force cleanup of hanging sessions"
         )
+        ENABLE_UPDATE_CHECK: bool = Field(
+            default=True, description="Check for updates automatically on chat start"
+        )
         # Server Configurations
         SERVERS: str = Field(
             default="""[
@@ -99,6 +102,11 @@ class Pipe:
         self.command_threads = {}  # Track running command threads
         self.thread_pool = ThreadPoolExecutor(max_workers=5)
         self.stop_flags = {}  # Flags to signal thread termination
+        self.current_version = "1.3"  # Current version
+        self.version_check_url = "https://raw.githubusercontent.com/teodorgross/ssh-server-manager-openwebui/refs/heads/main/version"
+        self.openwebui_url = "https://openwebui.com/f/teodorgross/ssh_server_agent"
+        self.last_update_check = None
+        self.latest_version_info = None
         self.init_database()
         self.session_passwords = {}
         self.server_configs = []
@@ -154,6 +162,145 @@ class Pipe:
 
         except Exception as e:
             print(f"Error syncing servers to database: {e}")
+
+    def check_for_updates(self, force_check: bool = False) -> Optional[Dict[str, Any]]:
+        """Check for new version on GitHub"""
+        if not self.valves.ENABLE_UPDATE_CHECK and not force_check:
+            return None
+
+        if not HTTP_AVAILABLE:
+            return {
+                "update_available": False,
+                "error": "HTTP requests not available",
+                "current_version": self.current_version,
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        # For automatic checks on chat init, always check but respect cache for manual calls
+        now = datetime.now()
+        should_check = (
+            force_check
+            or not self.last_update_check
+            or now - self.last_update_check < timedelta(minutes=5)
+        )  # Minimum 5 minutes between checks
+
+        if not should_check and self.latest_version_info:
+            return self.latest_version_info
+
+        try:
+            print("DEBUG: Checking for updates...")
+            response = requests.get(self.version_check_url, timeout=5)
+            response.raise_for_status()
+
+            latest_version = response.text.strip()
+            self.last_update_check = now
+
+            # Compare versions
+            if self.is_newer_version(latest_version, self.current_version):
+                self.latest_version_info = {
+                    "update_available": True,
+                    "latest_version": latest_version,
+                    "current_version": self.current_version,
+                    "download_url": self.openwebui_url,
+                    "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                print(f"DEBUG: Update available: {latest_version}")
+            else:
+                self.latest_version_info = {
+                    "update_available": False,
+                    "latest_version": latest_version,
+                    "current_version": self.current_version,
+                    "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                print(
+                    f"DEBUG: No update needed. Current: {self.current_version}, Latest: {latest_version}"
+                )
+
+            return self.latest_version_info
+
+        except requests.exceptions.ConnectionError:
+            error_info = {
+                "update_available": False,
+                "error": "No internet connection",
+                "current_version": self.current_version,
+                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            print("DEBUG: Update check failed - No internet connection")
+            return error_info
+        except requests.exceptions.Timeout:
+            error_info = {
+                "update_available": False,
+                "error": "Connection timeout",
+                "current_version": self.current_version,
+                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            print("DEBUG: Update check failed - Timeout")
+            return error_info
+        except requests.exceptions.HTTPError as e:
+            error_info = {
+                "update_available": False,
+                "error": f"Server error: {e.response.status_code}",
+                "current_version": self.current_version,
+                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            print(f"DEBUG: Update check failed - HTTP {e.response.status_code}")
+            return error_info
+        except Exception as e:
+            error_info = {
+                "update_available": False,
+                "error": f"Check failed: {str(e)}",
+                "current_version": self.current_version,
+                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            print(f"DEBUG: Update check failed: {e}")
+            return error_info
+
+    def is_newer_version(self, latest: str, current: str) -> bool:
+        """Compare version strings (supports X.Y format)"""
+        try:
+
+            def version_tuple(v):
+                return tuple(map(int, v.split(".")))
+
+            return version_tuple(latest) > version_tuple(current)
+        except:
+            # Fallback to string comparison
+            return latest != current
+
+    def get_update_notification(self) -> str:
+        """Get update notification message"""
+        update_info = self.check_for_updates()
+
+        if not update_info:
+            return ""
+
+        # Handle errors
+        if update_info.get("error"):
+            return f"""⚠️ **UPDATE CHECK FAILED**
+
+🔍 **Status:** {update_info['error']}
+📅 **Checked:** {update_info['checked_at']}
+📦 **Current Version:** {update_info['current_version']}
+
+💡 **Note:** Update checks will retry automatically when connection is restored.
+
+---"""
+
+        # Handle updates available
+        if update_info.get("update_available"):
+            return f"""🚀 **NEW VERSION AVAILABLE!**
+
+📦 **Current Version:** {update_info['current_version']}
+✨ **Latest Version:** {update_info['latest_version']}
+📅 **Checked:** {update_info['checked_at']}
+
+🔗 **Download:** {update_info['download_url']}
+
+💡 **To update:** Copy the latest code from GitHub and replace your current pipe.
+
+---"""
+
+        return ""
 
     def init_database(self):
         """Initialize SQLite database"""
@@ -1682,8 +1829,54 @@ class Pipe:
             return self.list_servers()
         elif "help" in lower_input:
             return self.show_manager_help()
+        elif any(
+            keyword in lower_input for keyword in ["check updates", "update", "version"]
+        ):
+            return self.show_update_status()
         else:
             return self.show_manager_welcome()
+
+    def show_update_status(self) -> str:
+        """Show current update status"""
+        update_info = self.check_for_updates()
+
+        if not update_info:
+            return f"""🔍 **Update Check**
+
+❌ **Unable to check for updates**
+- Check your internet connection
+- Ensure requests library is available
+
+**Current Version:** {self.current_version}
+**GitHub:** {self.openwebui_url}"""
+
+        if update_info.get("update_available"):
+            return f"""🚀 **UPDATE AVAILABLE!**
+
+📦 **Current Version:** {update_info['current_version']}
+✨ **Latest Version:** {update_info['latest_version']}
+📅 **Last Checked:** {update_info['checked_at']}
+
+## 🔄 **How to Update:**
+1. Visit: {update_info['download_url']}
+2. Copy the latest code
+3. Replace your current pipe
+4. Save and reload
+
+## 📋 **What's New:**
+Check the repository for changelog and new features!
+
+💡 **Tip:** Always backup your current configuration before updating."""
+        else:
+            return f"""✅ **YOU'RE UP TO DATE!**
+
+📦 **Current Version:** {update_info['current_version']}
+📅 **Last Checked:** {update_info['checked_at']}
+
+🔍 **Automatic checks:** Every {self.valves.UPDATE_CHECK_INTERVAL} hours
+⚙️ **Settings:** Update checks can be disabled in Valves
+
+**GitHub:** {self.openwebui_url}"""
 
     def list_servers(self) -> str:
         """List all configured servers from valves"""
@@ -1726,21 +1919,37 @@ Edit the **SERVERS** setting in the valves and add your server configurations.
 
     def show_manager_help(self) -> str:
         """Show manager help"""
-        return """🔧 **SSH Server Manager - Help**
+        return f"""🔧 **SSH Server Manager - Help**
 
 ## 📋 **Server Management**
 - `list servers` - Show configured servers
 - `help` - Show this help
+- `check updates` - Check for new versions
+
+## 🔄 **Update System**
+- **Automatic checks:** Every time chat is initiated
+- **Manual check:** `check updates` or `version`
+- **Current version:** {self.current_version}
 
 💡 **Start by configuring servers in the Valves settings!**"""
 
     def show_manager_welcome(self) -> str:
-        """Show welcome message"""
-        return """
-----
-### GitHub: https://github.com/teodorgross/ssh-server-manager-openwebui
-### Support Me: https://ko-fi.com/teodorgross 
-----
+        """Show welcome message with update notification and conditional content"""
+        # Check for updates
+        update_notification = self.get_update_notification()
+
+        # Check if user has custom servers (not default configuration)
+        has_custom_servers = self.has_custom_server_configuration()
+
+        welcome_message = f"""{update_notification}
+
+GitHub: https://github.com/teodorgross/ssh-server-manager-openwebui | Support: https://ko-fi.com/teodorgross | Version: {self.current_version}
+
+---"""
+
+        # Only show setup instructions if using default configuration
+        if not has_custom_servers:
+            welcome_message += """
 
 ## 🚀 **Quick Start**
 1. **Configure servers:** Edit the **SERVERS** setting in the Valves
@@ -1780,13 +1989,25 @@ Servers are configured directly in the pipe settings (Valves):
         "port": 2222
     }
 ]
-```
+```"""
+        else:
+            # Show simplified interface for users with custom configuration
+            welcome_message += f"""
+
+## 🎯 **Your Servers** ({len(self.server_configs)} configured)
+- **List servers:** `list servers`
+- **Connect:** `ssh <server_name>`
+- **Manage:** Edit servers in Valves settings"""
+
+        # Common commands section (always shown)
+        welcome_message += """
 
 ## 🎯 **Available Commands**
 - `ssh <server_name>` - Connect to a specific server
 - `connect <server_name>` - Alternative connection command
 - `list servers` - Show configured servers
 - `help` - Show this help
+- `check updates` - Check for new versions
 
 ## 📝 **Connection Examples**
 - `ssh production`
@@ -1794,6 +2015,53 @@ Servers are configured directly in the pipe settings (Valves):
 - `ssh development`
 
 💡 **Tip:** After changing Valves settings, the configuration is automatically reloaded."""
+
+        return welcome_message
+
+    def has_custom_server_configuration(self) -> bool:
+        """Check if user has configured custom servers (not default config)"""
+        if not self.server_configs:
+            return False
+
+        # Check against exact default configuration structure
+        default_servers = [
+            {
+                "name": "production",
+                "host": "192.168.1.100",
+                "username": "admin",
+                "password": "your_password_here",
+                "model": "llama3.2",
+                "port": 22,
+            },
+            {
+                "name": "development",
+                "host": "192.168.1.101",
+                "username": "dev",
+                "password": "dev_password_here",
+                "model": "gemma2",
+                "port": 22,
+            },
+        ]
+
+        # If number of servers is different, it's custom
+        if len(self.server_configs) != len(default_servers):
+            return True
+
+        # Check each server against defaults
+        for i, server in enumerate(self.server_configs):
+            if i >= len(default_servers):
+                return True
+
+            default = default_servers[i]
+
+            # Check key fields - if any are different, it's custom
+            key_fields = ["name", "host", "username", "password", "model"]
+            for field in key_fields:
+                if server.get(field) != default.get(field):
+                    return True
+
+        # If we get here, it's still the default configuration
+        return False
 
     def generate_ai_command(
         self, user_request: str, username: str, model: str
