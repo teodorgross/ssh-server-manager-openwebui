@@ -1,0 +1,1736 @@
+"""
+title: 🔧 SSH Server Agent
+author: Teodor Gross
+description: AI-powered SSH server management with interactive sessions
+version: 1.0
+requirements: paramiko, requests
+Github: https://github.com/teodorgross/ssh-server-manager-openwebui
+"""
+
+import sqlite3
+import json
+import re
+import hashlib
+import base64
+from datetime import datetime
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, List
+
+# Try import dependencies
+try:
+    import paramiko
+
+    SSH_AVAILABLE = True
+except ImportError:
+    SSH_AVAILABLE = False
+
+try:
+    import requests
+
+    HTTP_AVAILABLE = True
+except ImportError:
+    HTTP_AVAILABLE = False
+
+
+class ServerConfig(BaseModel):
+    name: str = Field(description="Server display name")
+    host: str = Field(description="Server hostname or IP")
+    username: str = Field(description="SSH username")
+    password: str = Field(description="SSH password")
+    model: str = Field(description="Ollama model to use")
+    port: int = Field(default=22, description="SSH port")
+
+
+class Pipe:
+    class Valves(BaseModel):
+        OLLAMA_BASE_URL: str = Field(
+            default="http://localhost:11434/api/chat", description="Ollama API base URL"
+        )
+        SSH_TIMEOUT: int = Field(
+            default=15, description="SSH connection timeout in seconds"
+        )
+        AUTO_EXECUTE_HIGH_CONFIDENCE: bool = Field(
+            default=False,
+            description="Automatically execute high-confidence AI commands",
+        )
+        # Server Configurations
+        SERVERS: str = Field(
+            default="""[
+    {
+        "name": "production",
+        "host": "192.168.1.100",
+        "username": "admin",
+        "password": "your_password_here",
+        "model": "llama3.2",
+        "port": 22
+    },
+    {
+        "name": "development",
+        "host": "192.168.1.101",
+        "username": "dev",
+        "password": "dev_password_here",
+        "model": "gemma2",
+        "port": 22
+    }
+]""",
+            description="JSON array of server configurations. Example structure provided above.",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.db_file = "ssh_ollama_enhanced.db"
+        self.active_sessions = {}
+        self.last_interactive_command = {}  # Store interactive commands
+        self.pending_interactive_sessions = {}  # Store active interactive sessions
+        self.init_database()
+        self.session_passwords = {}
+        self.server_configs = []
+        self.load_server_configs()
+
+    def load_server_configs(self):
+        """Load server configurations from valves"""
+        try:
+            servers_json = self.valves.SERVERS.strip()
+            if servers_json:
+                self.server_configs = json.loads(servers_json)
+                self.sync_servers_to_database()
+        except json.JSONDecodeError as e:
+            print(f"Error parsing server configurations: {e}")
+            self.server_configs = []
+        except Exception as e:
+            print(f"Error loading server configurations: {e}")
+            self.server_configs = []
+
+    def sync_servers_to_database(self):
+        """Sync server configurations from valves to database"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+
+            # Clear existing servers
+            conn.execute("DELETE FROM servers")
+
+            # Insert servers from valves
+            for server in self.server_configs:
+                server_id = server["name"].lower().replace(" ", "_").replace("-", "_")
+                encrypted_password = self.encrypt_password(
+                    server["password"], server_id
+                )
+
+                conn.execute(
+                    """INSERT INTO servers 
+                       (id, name, host, username, model, password_hash, port) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        server_id,
+                        server["name"],
+                        server["host"],
+                        server["username"],
+                        server["model"],
+                        encrypted_password,
+                        server.get("port", 22),
+                    ),
+                )
+
+            conn.commit()
+            conn.close()
+            print(f"Synced {len(self.server_configs)} servers to database")
+
+        except Exception as e:
+            print(f"Error syncing servers to database: {e}")
+
+    def init_database(self):
+        """Initialize SQLite database"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS servers (
+                    id TEXT PRIMARY KEY,
+                    name TEXT UNIQUE,
+                    host TEXT,
+                    username TEXT,
+                    model TEXT,
+                    password_hash TEXT,
+                    port INTEGER DEFAULT 22,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP
+                )
+            """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS command_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id TEXT,
+                    command TEXT,
+                    ai_generated BOOLEAN,
+                    confidence TEXT,
+                    success BOOLEAN,
+                    output TEXT,
+                    executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Database init error: {e}")
+
+    def encrypt_password(self, password: str, server_id: str) -> str:
+        """Simple password encryption"""
+        encoded = base64.b64encode(password.encode()).decode()
+        return encoded
+
+    def decrypt_password(self, encrypted: str, server_id: str) -> str:
+        """Decrypt password"""
+        try:
+            return base64.b64decode(encrypted.encode()).decode()
+        except:
+            return ""
+
+    def pipes(self):
+
+        try:
+            # Reload server configs to get latest from valves
+            self.load_server_configs()
+
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.execute(
+                "SELECT id, name, host, username, model FROM servers ORDER BY name"
+            )
+            servers = cursor.fetchall()
+            conn.close()
+
+            models = [
+                {"id": "ssh-manager", "name": "🔧 SSH Server Manager"},
+            ]
+
+            return models
+
+        except Exception as e:
+            return [{"id": "ssh-error", "name": f"❌ SSH Error: {str(e)}"}]
+
+    def call_ollama(self, prompt: str, model: str) -> Optional[str]:
+        """Call Ollama API"""
+        try:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            }
+
+            if HTTP_AVAILABLE:
+                response = requests.post(
+                    self.valves.OLLAMA_BASE_URL, json=payload, timeout=30
+                )
+                response.raise_for_status()
+                result = response.json()
+                return result.get("message", {}).get("content", "")
+            else:
+                return "❌ HTTP requests not available"
+
+        except Exception as e:
+            return f"❌ Ollama API error: {e}"
+
+    def execute_ssh_command(
+        self,
+        server_info: tuple,
+        command: str,
+        password: str = None,
+        user_input: str = None,
+    ) -> Dict[str, Any]:
+        """Execute SSH command with improved interactive input handling"""
+        if not SSH_AVAILABLE:
+            return {"success": False, "error": "SSH not available - install paramiko"}
+
+        try:
+            server_id, name, host, username, model = server_info[:5]
+            port = server_info[6] if len(server_info) > 6 else 22
+
+            if not password:
+                return {"success": False, "error": "No password provided"}
+            ssh_password = password
+
+            # Create SSH connection
+            session_key = f"{server_id}_{username}_{host}"
+
+            # Check if we have a pending interactive session
+            if (
+                session_key in self.pending_interactive_sessions
+                and user_input is not None
+            ):
+                return self.continue_interactive_session(
+                    session_key, user_input, ssh_password
+                )
+
+            if session_key in self.active_sessions:
+                client = self.active_sessions[session_key]
+                try:
+                    client.exec_command("echo test", timeout=5)
+                except:
+                    del self.active_sessions[session_key]
+                    client = None
+            else:
+                client = None
+
+            if not client:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(
+                    hostname=host,
+                    username=username,
+                    password=ssh_password,
+                    port=port,
+                    timeout=self.valves.SSH_TIMEOUT,
+                )
+                self.active_sessions[session_key] = client
+                self.session_passwords[session_key] = ssh_password
+
+            # Execute command with PTY for full terminal experience
+            stdin, stdout, stderr = client.exec_command(command, get_pty=True)
+
+            # Store the session for potential interactive continuation
+            self.pending_interactive_sessions[session_key] = {
+                "stdin": stdin,
+                "stdout": stdout,
+                "stderr": stderr,
+                "command": command,
+                "ssh_password": ssh_password,
+            }
+
+            # If user provided input, send it immediately
+            if user_input is not None:
+                stdin.write(user_input + "\n")
+                stdin.flush()
+
+            # Simple approach: Wait for a reasonable time, then check if still running
+            import time
+
+            full_output = ""
+            password_filtered = False
+            wait_time = 0
+            max_wait = 12  # Increased wait time for sudo commands
+            sudo_password_sent = False
+
+            # Read initial output quickly
+            while wait_time < max_wait:
+                if stdout.channel.recv_ready():
+                    chunk = stdout.channel.recv(4096).decode("utf-8", errors="ignore")
+
+                    # Handle sudo password prompt automatically
+                    if not sudo_password_sent and "sudo" in command.lower():
+                        if any(
+                            indicator in chunk.lower()
+                            for indicator in ["[sudo]", "password for", "password:"]
+                        ):
+                            # Send the SSH password for sudo
+                            stdin.write(ssh_password + "\n")
+                            stdin.flush()
+                            sudo_password_sent = True
+
+                            # Continue reading after sending password
+                            time.sleep(0.5)
+                            continue
+
+                    # Handle sudo password filtering for display
+                    if not password_filtered and "sudo" in command.lower():
+                        if "[sudo]" in chunk or "password" in chunk.lower():
+                            lines = chunk.split("\n")
+                            filtered_chunk = ""
+                            skip_line = False
+
+                            for line in lines:
+                                if (
+                                    "[sudo]" in line.lower()
+                                    or "password for" in line.lower()
+                                    or ssh_password in line
+                                ):
+                                    skip_line = True
+                                    continue
+                                else:
+                                    if skip_line and line.strip():
+                                        skip_line = False
+                                    if not skip_line:
+                                        filtered_chunk += line + "\n"
+
+                            chunk = filtered_chunk
+                            password_filtered = True
+
+                    full_output += chunk
+                    wait_time = 0  # Reset wait time when we get output
+
+                # Check if command finished
+                if stdout.channel.exit_status_ready():
+                    # Command completed, clean up interactive session
+                    if session_key in self.pending_interactive_sessions:
+                        del self.pending_interactive_sessions[session_key]
+                    break
+
+                time.sleep(0.3)
+                wait_time += 0.3
+
+            # If command is still running after timeout, it might be interactive
+            if not stdout.channel.exit_status_ready():
+                # Check if this looks like an interactive prompt
+                if self.looks_like_interactive_prompt(full_output):
+                    return {
+                        "success": False,
+                        "interaction_required": True,
+                        "output": full_output,
+                        "prompt_hint": self.extract_prompt_hint(full_output),
+                        "command": command,
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "session_key": session_key,
+                    }
+                else:
+                    # Force kill the command and return what we have
+                    try:
+                        stdin.close()
+                        if session_key in self.pending_interactive_sessions:
+                            del self.pending_interactive_sessions[session_key]
+                    except:
+                        pass
+
+            # Get any remaining output
+            try:
+                remaining = stdout.read().decode("utf-8", errors="ignore")
+                if remaining and not any(
+                    skip in remaining for skip in [ssh_password, "[sudo]"]
+                ):
+                    full_output += remaining
+            except:
+                pass
+
+            # Get stderr
+            error_output = ""
+            try:
+                stderr_content = stderr.read().decode("utf-8", errors="ignore")
+                if stderr_content:
+                    if (
+                        ssh_password not in stderr_content
+                        and "[sudo]" not in stderr_content.lower()
+                    ):
+                        error_output = stderr_content
+            except:
+                pass
+
+            try:
+                exit_code = stdout.channel.recv_exit_status()
+            except:
+                exit_code = 0  # Assume success if we can't get exit code
+
+            # Clean up completed session
+            if session_key in self.pending_interactive_sessions:
+                del self.pending_interactive_sessions[session_key]
+
+            # Update server usage
+            self.update_server_usage(server_id)
+
+            # Clean output but preserve formatting and progress indicators
+            clean_output = self.clean_but_preserve_formatting(full_output, ssh_password)
+
+            return {
+                "success": exit_code == 0,
+                "output": clean_output,
+                "error": error_output.strip(),
+                "exit_code": exit_code,
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "is_streaming_cmd": self.is_streaming_command(command),
+            }
+
+        except paramiko.AuthenticationException:
+            return {
+                "success": False,
+                "error": "Authentication failed - check credentials in valves",
+                "exit_code": -1,
+            }
+        except paramiko.SSHException as e:
+            return {"success": False, "error": f"SSH error: {e}", "exit_code": -1}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Connection error: {e}",
+                "exit_code": -1,
+            }
+
+    def continue_interactive_session(
+        self, session_key: str, user_input: str, ssh_password: str
+    ) -> Dict[str, Any]:
+        """Continue an existing interactive session with user input"""
+        if session_key not in self.pending_interactive_sessions:
+            return {"success": False, "error": "No pending interactive session found"}
+
+        session_data = self.pending_interactive_sessions[session_key]
+        stdin = session_data["stdin"]
+        stdout = session_data["stdout"]
+        stderr = session_data["stderr"]
+        command = session_data["command"]
+
+        try:
+            # Send user input
+            stdin.write(user_input + "\n")
+            stdin.flush()
+
+            import time
+
+            full_output = ""
+            wait_time = 0
+            max_wait = 8
+
+            # Read output after input
+            while wait_time < max_wait:
+                if stdout.channel.recv_ready():
+                    chunk = stdout.channel.recv(4096).decode("utf-8", errors="ignore")
+                    # Filter out password echoes
+                    if ssh_password not in chunk:
+                        full_output += chunk
+                    wait_time = 0
+
+                # Check if command finished
+                if stdout.channel.exit_status_ready():
+                    # Command completed, clean up interactive session
+                    del self.pending_interactive_sessions[session_key]
+                    break
+
+                time.sleep(0.2)
+                wait_time += 0.2
+
+            # If still running, check if it needs more input
+            if not stdout.channel.exit_status_ready():
+                if self.looks_like_interactive_prompt(full_output):
+                    return {
+                        "success": False,
+                        "interaction_required": True,
+                        "output": full_output,
+                        "prompt_hint": self.extract_prompt_hint(full_output),
+                        "command": command,
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "session_key": session_key,
+                    }
+
+            # Get remaining output and complete
+            try:
+                remaining = stdout.read().decode("utf-8", errors="ignore")
+                if remaining and ssh_password not in remaining:
+                    full_output += remaining
+            except:
+                pass
+
+            # Get stderr
+            error_output = ""
+            try:
+                stderr_content = stderr.read().decode("utf-8", errors="ignore")
+                if stderr_content and ssh_password not in stderr_content:
+                    error_output = stderr_content
+            except:
+                pass
+
+            try:
+                exit_code = stdout.channel.recv_exit_status()
+            except:
+                exit_code = 0
+
+            # Clean up session
+            if session_key in self.pending_interactive_sessions:
+                del self.pending_interactive_sessions[session_key]
+
+            return {
+                "success": exit_code == 0,
+                "output": self.clean_but_preserve_formatting(full_output, ssh_password),
+                "error": error_output.strip(),
+                "exit_code": exit_code,
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "continued_session": True,
+            }
+
+        except Exception as e:
+            # Clean up on error
+            if session_key in self.pending_interactive_sessions:
+                del self.pending_interactive_sessions[session_key]
+            return {"success": False, "error": f"Interactive session error: {e}"}
+
+    def looks_like_interactive_prompt(self, output: str) -> bool:
+        """Simple check if output looks like it's waiting for input"""
+        if not output:
+            return False
+
+        # Check last few lines for common interactive patterns
+        lines = output.strip().split("\n")
+        last_lines = "\n".join(lines[-3:]).lower()
+
+        interactive_indicators = [
+            "[y/n]",
+            "[yes/no]",
+            "(y/n)",
+            "(yes/no)",
+            "password:",
+            "enter",
+            "input",
+            "choose",
+            "select",
+            "continue?",
+            "proceed?",
+            "press",
+            "type",
+            ":",
+            "?",
+        ]
+
+        return any(indicator in last_lines for indicator in interactive_indicators)
+
+    def extract_prompt_hint(self, output: str) -> str:
+        """Extract a simple hint about what the prompt is asking"""
+        if not output:
+            return "Interactive input needed"
+
+        lines = output.strip().split("\n")
+        last_line = lines[-1] if lines else ""
+
+        # Common patterns
+        if "[y/n]" in last_line.lower() or "[yes/no]" in last_line.lower():
+            return "Expecting yes/no answer (y/n)"
+        elif "password" in last_line.lower():
+            return "Expecting password input"
+        elif "enter" in last_line.lower():
+            return "Expecting text input"
+        elif any(word in last_line.lower() for word in ["choose", "select"]):
+            return "Expecting menu selection (number)"
+        else:
+            return f"Prompt: {last_line[-100:]}"  # Show last part of the prompt
+
+    def clean_but_preserve_formatting(self, output: str, password: str) -> str:
+        """Clean output but preserve progress bars, percentages, and formatting"""
+        if not output:
+            return ""
+
+        lines = output.split("\n")
+        cleaned_lines = []
+
+        for line in lines:
+            # Skip password-related lines
+            if password and password in line:
+                continue
+            if "[sudo]" in line.lower():
+                continue
+            if "password for" in line.lower():
+                continue
+
+            # Keep progress indicators, percentages, download info
+            if any(
+                indicator in line
+                for indicator in [
+                    "%",
+                    "MB",
+                    "KB",
+                    "GB",
+                    "Hit:",
+                    "Get:",
+                    "Ign:",
+                    "Reading",
+                    "Building",
+                    "Downloading",
+                    "Installing",
+                    "Unpacking",
+                ]
+            ):
+                cleaned_lines.append(line)
+            # Keep regular output
+            elif line.strip():
+                cleaned_lines.append(line)
+
+        return "\n".join(cleaned_lines)
+
+    def is_streaming_command(self, command: str) -> bool:
+        """Check if command typically produces streaming output"""
+        streaming_patterns = [
+            "apt",
+            "yum",
+            "dnf",
+            "pacman",
+            "pip",
+            "npm",
+            "yarn",
+            "wget",
+            "curl",
+            "rsync",
+            "scp",
+            "git clone",
+            "docker pull",
+            "make",
+            "compile",
+            "build",
+            "install",
+            "update",
+            "upgrade",
+            "tar",
+            "unzip",
+            "cp",
+            "mv",
+            "dd",
+        ]
+
+        return any(pattern in command.lower() for pattern in streaming_patterns)
+
+    def update_server_usage(self, server_id: str):
+        """Update server last used timestamp"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            conn.execute(
+                "UPDATE servers SET last_used = CURRENT_TIMESTAMP WHERE id = ?",
+                (server_id,),
+            )
+            conn.commit()
+            conn.close()
+        except:
+            pass
+
+    def get_server_info(self, model_id: str):
+        """Get server information from model ID"""
+        print(f"DEBUG: get_server_info called with model_id: '{model_id}'")
+
+        if not model_id.startswith("ssh."):
+            return None
+
+        server_id = model_id[4:]  # Remove "ssh." prefix
+        print(f"DEBUG: Looking for server_id: '{server_id}'")
+
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,))
+            server = cursor.fetchone()
+            conn.close()
+            print(f"DEBUG: Found server: {server}")
+            return server
+        except Exception as e:
+            print(f"DEBUG: Error in get_server_info: {e}")
+            return None
+
+    def save_command_history(
+        self,
+        server_id: str,
+        command: str,
+        ai_generated: bool,
+        confidence: str,
+        success: bool,
+        output: str,
+    ):
+        """Save command to history"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            conn.execute(
+                """
+                INSERT INTO command_history (server_id, command, ai_generated, confidence, success, output)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                (server_id, command, ai_generated, confidence, success, output),
+            )
+            conn.commit()
+            conn.close()
+        except:
+            pass
+
+    def pipe(self, body: dict, __user__: Optional[dict] = None) -> str:
+        """Main pipe function"""
+        model_id = body.get("model", "")
+        messages = body.get("messages", [])
+
+        if not messages:
+            return "❌ No messages provided"
+
+        last_message = messages[-1].get("content", "").strip()
+
+        # Debug logging
+        print(f"DEBUG: model_id = '{model_id}'")
+        print(f"DEBUG: last_message = '{last_message}'")
+
+        # Check if we're already connected to a server (by checking previous messages)
+        server_context = self.get_server_context(messages)
+        if server_context:
+            print(f"DEBUG: Found server context: {server_context}")
+            return self.handle_server_commands(last_message, server_context)
+
+        # Check for direct SSH connection commands
+        if last_message.lower().startswith("ssh ") or last_message.lower().startswith(
+            "connect "
+        ):
+            return self.handle_direct_ssh_connection(last_message)
+
+        # Route to appropriate handler
+        if "ssh-manager" in model_id:
+            return self.handle_manager_commands(last_message)
+        elif "ssh." in model_id:
+            server_info = self.get_server_info(model_id)
+            if not server_info:
+                return "❌ Server not found or not configured in valves"
+            return self.handle_server_commands(last_message, server_info)
+        else:
+            # Default to manager
+            return self.handle_manager_commands(last_message)
+
+    def handle_direct_ssh_connection(self, command: str) -> str:
+        """Handle direct SSH connection commands like 'ssh webserver' or 'connect production'"""
+        try:
+            # Parse command to get server name
+            if command.lower().startswith("ssh "):
+                server_name = command[4:].strip()
+            elif command.lower().startswith("connect "):
+                server_name = command[8:].strip()
+            else:
+                return "❌ Invalid SSH command format"
+
+            if not server_name:
+                return "❌ No server name specified"
+
+            # Look for server in configured servers
+            server_info = self.get_server_by_name(server_name)
+            if not server_info:
+                available_servers = [server["name"] for server in self.server_configs]
+                if available_servers:
+                    return f"""❌ **Server '{server_name}' not found**
+
+**Available servers:**
+{chr(10).join([f"- {name}" for name in available_servers])}
+
+**Usage:** `ssh <server_name>` or `connect <server_name>`
+**Example:** `ssh production`"""
+                else:
+                    return f"""❌ **Server '{server_name}' not found**
+
+**No servers configured.** Please configure servers in the Valves settings first.
+
+**Usage:** `ssh <server_name>` or `connect <server_name>`"""
+
+            # Connect to the server
+            return self.connect_to_server(server_info)
+
+        except Exception as e:
+            return f"❌ Error connecting to server: {e}"
+
+    def get_server_context(self, messages: list) -> Optional[tuple]:
+        """Check if we're in a server session by looking at conversation history"""
+        # Look for the most recent connection or disconnection message
+        for message in reversed(messages):
+            content = message.get("content", "").strip()
+
+            # If we find a disconnect message, we're NOT connected
+            if "🔌 **Disconnected from" in content:
+                return None
+
+            # If we find a connection message, we ARE connected
+            if "🟢 **Connected to" in content and "Current Session:" in content:
+                # Extract server name from the connection message
+                lines = content.split("\n")
+                for line in lines:
+                    if "Connected to" in line:
+                        # Extract server name between "Connected to " and "**"
+                        start = line.find("Connected to ") + 13
+                        end = line.find("**", start)
+                        if start > 12 and end > start:
+                            server_name = line[start:end].strip()
+                            return self.get_server_by_name(server_name)
+        return None
+
+    def get_server_by_name(self, server_name: str) -> Optional[tuple]:
+        """Get server info by name"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.execute(
+                "SELECT * FROM servers WHERE name = ? OR id = ?",
+                (server_name, server_name),
+            )
+            server = cursor.fetchone()
+            conn.close()
+            return server
+        except:
+            return None
+
+    def show_help(self) -> str:
+        """Show help"""
+        return """🔧 **SSH-Ollama Enhanced - Help**
+
+## 🎯 **Interactive Commands**
+- `/help` - Show this help
+- `/status` - Show connection status
+- `/history` - Show command history
+- `/test` - Test SSH connection
+- `$ ` - Execute command directly
+
+## 🤖 **AI Features**
+- Natural language: "install nginx", "check disk space"
+- Auto sudo detection
+- Safety validation
+
+## 📝 **Examples**
+- `install docker`
+- `check memory usage`
+- `$ ls -la`
+- `/test`
+
+💡 **Tip:** Use natural language for complex tasks!"""
+
+    def handle_manager_commands(self, user_input: str) -> str:
+        """Handle manager commands"""
+        lower_input = user_input.lower()
+
+        if any(keyword in lower_input for keyword in ["list", "show", "servers"]):
+            return self.list_servers()
+        elif "help" in lower_input:
+            return self.show_manager_help()
+        else:
+            return self.show_manager_welcome()
+
+    def list_servers(self) -> str:
+        """List all configured servers from valves"""
+        try:
+            # Reload from valves to get current config
+            self.load_server_configs()
+
+            if not self.server_configs:
+                return """📋 **No Servers Configured**
+
+🚀 **To add servers:**
+Edit the **SERVERS** setting in the valves and add your server configurations.
+
+**Example:**
+```json
+[
+    {
+        "name": "production",
+        "host": "192.168.1.100",
+        "username": "admin",
+        "password": "your_password_here",
+        "model": "llama3.2",
+        "port": 22
+    }
+]
+```"""
+
+            result = "📋 **Configured Servers:**\n\n"
+            for server in self.server_configs:
+                result += f"**🟢 {server['name']}**\n"
+                result += f"  📍 Host: {server['host']}:{server.get('port', 22)}\n"
+                result += f"  👤 User: {server['username']}\n"
+                result += f"  🤖 Model: {server['model']}\n\n"
+
+            result += "💡 **Usage:** `ssh <server_name>` or select from model dropdown"
+            return result
+
+        except Exception as e:
+            return f"❌ Error listing servers: {e}"
+
+    def show_manager_help(self) -> str:
+        """Show manager help"""
+        return """🔧 **SSH Server Manager - Help**
+
+## 📋 **Server Management**
+- `list servers` - Show configured servers
+- `help` - Show this help
+
+💡 **Start by configuring servers in the Valves settings!**"""
+
+    def show_manager_welcome(self) -> str:
+        """Show welcome message"""
+        return """
+----
+### GitHub: https://github.com/teodorgross/ssh-server-manager-openwebui
+### Support Me: https://ko-fi.com/teodorgross 
+----
+
+## 🚀 **Quick Start**
+1. **Configure servers:** Edit the **SERVERS** setting in the Valves
+2. **List servers:** `list servers`
+3. **Connect:** `ssh <server_name>` or select from model dropdown
+4. **Execute commands:** Use natural language like "install nginx"
+
+## 🔌 **Connection Methods**
+- **Direct command:** `ssh production` or `connect webserver`
+- **Model dropdown:** Select "🖥️ production (admin@192.168.1.100)"
+
+## ⚙️ **Server Configuration via Valves**
+Servers are configured directly in the pipe settings (Valves):
+
+1. Open the pipe settings
+2. Edit the **SERVERS** field  
+3. Add your servers in JSON format
+4. Save the settings
+
+**JSON Format:**
+```json
+[
+    {
+        "name": "production",
+        "host": "192.168.1.100",
+        "username": "admin", 
+        "password": "secure_password",
+        "model": "llama3.2",
+        "port": 22
+    },
+    {
+        "name": "webserver",
+        "host": "web.example.com",
+        "username": "www-data",
+        "password": "web_password",
+        "model": "gemma2",
+        "port": 2222
+    }
+]
+```
+
+## 🎯 **Available Commands**
+- `ssh <server_name>` - Connect to a specific server
+- `connect <server_name>` - Alternative connection command
+- `list servers` - Show configured servers
+- `help` - Show this help
+
+## 📝 **Connection Examples**
+- `ssh production`
+- `connect webserver`
+- `ssh development`
+
+💡 **Tip:** After changing Valves settings, the configuration is automatically reloaded."""
+
+    def generate_ai_command(
+        self, user_request: str, username: str, model: str
+    ) -> Dict[str, Any]:
+        """Generate AI command"""
+
+        # Handle casual/greeting messages intelligently
+        casual_patterns = [
+            "was geht",
+            "wie geht's",
+            "hello",
+            "hi",
+            "hey",
+            "what's up",
+            "how are you",
+            "wie läuft's",
+            "alles klar",
+            "sup",
+            "yo",
+        ]
+
+        if any(pattern in user_request.lower() for pattern in casual_patterns):
+            return {
+                "command": "echo 'Hello! I am ready to help you manage this server. Try: check disk space, install software, show processes'",
+                "confidence": "high",
+                "explanation": "Friendly greeting response with helpful suggestions",
+                "requires_sudo": False,
+                "safety": "safe",
+            }
+
+        prompt = f"""You are an expert Linux system administrator. Generate a safe command for this request.
+
+IMPORTANT INSTRUCTIONS:
+- The user '{username}' is NOT root by default
+- For commands that require sudo privileges, use the sudo prefix instead of adding sudo to the command
+- Only use regular command if you're certain it doesn't need elevated privileges
+- Be conservative: if unsure, use sudo prefix
+
+User: {username}
+Request: {user_request}
+
+COMMAND FORMAT RULES:
+- If command needs root privileges: use "sudo command"
+- If command is safe for regular user: use "command" (without sudo)
+- Examples of commands that typically need sudo: package installation, system service management, editing system files, mounting drives
+- Examples of commands that use: ls, ps, df, cat (reading files), cd, grep, find (in user directories)
+
+Respond with JSON only:
+{{
+    "command": "exact command with proper prefix (sudo or $ only)",
+    "confidence": "high|medium|low",
+    "explanation": "what this command does and why this privilege level",
+    "requires_sudo": true/false,
+    "safety": "safe|caution|dangerous"
+}}
+
+Examples:
+- "check disk space": {{"command": "$ df -h", "confidence": "high", "explanation": "Shows disk usage - no privileges needed", "requires_sudo": false, "safety": "safe"}}
+- "install nginx": {{"command": "sudo apt update && apt install -y nginx", "confidence": "high", "explanation": "Installs nginx web server - requires root privileges", "requires_sudo": true, "safety": "safe"}}
+- "restart apache": {{"command": "sudo systemctl restart apache2", "confidence": "high", "explanation": "Restarts Apache service - requires root privileges", "requires_sudo": true, "safety": "safe"}}
+- "list files": {{"command": "$ ls -la", "confidence": "high", "explanation": "Lists files in current directory - no privileges needed", "requires_sudo": false, "safety": "safe"}}
+
+Return ONLY the JSON, no other text."""
+
+        ai_response = self.call_ollama(prompt, model)
+        if not ai_response or ai_response.startswith("❌"):
+            return {"error": ai_response or "AI service unavailable"}
+
+        try:
+            json_match = re.search(r"\{.*\}", ai_response, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                if "command" not in result:
+                    return {"error": "AI response missing command"}
+
+                # Clean any remaining prefixes from the command
+                command = result["command"].strip()
+                if command.startswith("$ "):
+                    command = command[2:]
+                elif command.startswith("sudo "):
+                    command = command[5:]
+
+                result["command"] = command
+                result.setdefault("confidence", "medium")
+                result.setdefault("explanation", "")
+                result.setdefault("requires_sudo", False)
+                result.setdefault("safety", "caution")
+                return result
+            else:
+                # Clean raw response too
+                clean_command = ai_response.strip()
+                if clean_command.startswith("$ "):
+                    clean_command = clean_command[2:]
+                elif clean_command.startswith("sudo "):
+                    clean_command = clean_command[5:]
+
+                return {
+                    "command": clean_command,
+                    "confidence": "low",
+                    "explanation": "Raw AI response",
+                    "requires_sudo": False,
+                    "safety": "caution",
+                }
+        except json.JSONDecodeError:
+            return {"error": "Failed to parse AI response"}
+
+    def handle_server_commands(self, user_input: str, server_info: tuple) -> str:
+        """Handle server commands"""
+        if not SSH_AVAILABLE:
+            return "❌ SSH not available. Install paramiko: `pip install paramiko`"
+
+        server_id, name = server_info[0], server_info[1]
+
+        # Check if this is a connection attempt
+        if not self.is_server_connected(server_info):
+            return self.connect_to_server(server_info)
+
+        # Check if this is a retry with input for interactive command
+        if user_input.startswith("!"):
+            return self.retry_interactive_command(user_input[1:].strip(), server_info)
+
+        # Handle slash commands
+        if user_input.startswith("/"):
+            return self.handle_slash_commands(user_input, server_info)
+
+        # Handle direct commands
+        if user_input.startswith("$"):
+            command = user_input[1:].strip()
+            if not command:
+                return "❌ No command specified"
+            return self.execute_direct_command(command, server_info)
+
+        # Handle natural language
+        return self.process_natural_language(user_input, server_info)
+
+    def is_server_connected(self, server_info: tuple) -> bool:
+        """Check if server is connected"""
+        server_id, name, host, username = server_info[:4]
+        session_key = f"{server_id}_{username}_{host}"
+        return session_key in self.session_passwords
+
+    def connect_to_server(self, server_info: tuple) -> str:
+        """Auto-connect to server using valves configuration"""
+        try:
+            server_id, name, host, username, model, password_hash = server_info[:6]
+            port = server_info[6] if len(server_info) > 6 else 22
+
+            # Decrypt password from database
+            password = self.decrypt_password(password_hash, server_id)
+
+            if not password:
+                return f"❌ **No password available for {name}**\n\nPlease check the server configuration in the Valves."
+
+            # Test connection immediately
+            result = self.execute_ssh_command(
+                server_info, "echo 'Connected successfully'", password
+            )
+
+            if result["success"]:
+                return f"""🟢 **Connected to {name}**
+
+📍 **Server:** {host}:{port}
+👤 **User:** {username}  
+🤖 **Model:** {model}
+
+## 🎯 **You can now use:**
+- **Natural language:** `install nginx`, `check disk space`
+- **Direct commands:** `$ ls -la`, `$ top`
+- **Interactive:** `/help`, `/test`, `/status`, `/history`
+
+💡 **Try:** `check system status` or `/test` to verify connection
+
+🔧 **Current Session:** You are now in server mode for {name}. All commands will be processed for this server."""
+            else:
+                return f"❌ **Connection failed:** {result.get('error', 'Authentication failed')}\n\nPlease check the server configuration in the Valves."
+
+        except Exception as e:
+            return f"❌ Connection error: {e}"
+
+    def retry_interactive_command(self, user_input: str, server_info: tuple) -> str:
+        """Retry the last command with user input"""
+        server_id = server_info[0]
+        session_key = (
+            f"{server_id}_{server_info[3]}_{server_info[2]}"  # server_id_username_host
+        )
+
+        # Get password from session
+        if session_key not in self.session_passwords:
+            return "❌ No active connection. Please connect first."
+
+        password = self.session_passwords[session_key]
+
+        # Try to continue existing interactive session first
+        if session_key in self.pending_interactive_sessions:
+            result = self.execute_ssh_command(server_info, "", password, user_input)
+        elif server_id in self.last_interactive_command:
+            # Fallback to old method
+            last_cmd = self.last_interactive_command[server_id]
+            result = self.execute_ssh_command(
+                server_info, last_cmd, password, user_input
+            )
+        else:
+            return "❌ No interactive command to retry. Run a command first."
+
+        if result.get("interaction_required"):
+            return f"""⌨️ **Still waiting for input on {server_info[1]}**
+
+**Command:** `{result.get('command', 'Unknown')}`
+**Previous Input:** `{user_input}`
+
+**Current Output:**
+```
+{result['output']}
+```
+
+**Hint:** {result['prompt_hint']}
+
+**Try again with:** `!your_response`"""
+
+        # Clear the interactive command since it's completed
+        if server_id in self.last_interactive_command:
+            del self.last_interactive_command[server_id]
+
+        # Save to history
+        self.save_command_history(
+            server_id,
+            f"{result.get('command', 'Interactive command')} (with input: {user_input})",
+            False,
+            "interactive",
+            result["success"],
+            result.get("output", ""),
+        )
+
+        # Format normal response
+        return self.format_command_result(
+            result,
+            result.get("command", "Interactive command"),
+            server_info[1],
+            user_input,
+        )
+
+    def format_command_result(
+        self, result: dict, command: str, server_name: str, user_input: str = None
+    ) -> str:
+        """Format command execution result"""
+        response = f"🖥️ **Command Execution on {server_name}**\n\n"
+        response += f"**Command:** `{command}`\n"
+
+        if user_input:
+            response += f"**Input Provided:** `{user_input}`\n"
+
+        response += f"**Timestamp:** {result.get('timestamp', 'Unknown')}\n\n"
+
+        if result["success"]:
+            response += "✅ **Success**\n\n"
+
+            if result["output"]:
+                output = result["output"]
+                if len(output) > 2000:
+                    response += f"```\n{output[:2000]}\n... (output truncated - {len(output)-2000} more characters)\n```"
+                else:
+                    response += f"```\n{output}\n```"
+            else:
+                response += "📝 Command executed successfully (no output)"
+        else:
+            response += "❌ **Failed**\n\n"
+            if result["error"]:
+                response += f"**Error Output:**\n```\n{result['error']}\n```"
+            response += f"\n**Exit Code:** {result['exit_code']}"
+
+        return response
+
+    def handle_slash_commands(self, command: str, server_info: tuple) -> str:
+        """Handle slash commands"""
+        server_id, name = server_info[0], server_info[1]
+        cmd_parts = command.split()
+        base_cmd = cmd_parts[0].lower()
+
+        if base_cmd == "/help":
+            return f"""🎯 **Interactive Commands for {name}**
+
+## 🔧 **Direct Execution**
+- `$ ` - Execute command directly (bypass AI)
+- `/direct ` - Same as $ prefix
+- `/sudo ` - Execute with sudo privileges
+
+## 📊 **Information & Control**
+- `/status` - Show connection and server status
+- `/history [n]` - Show last n commands (default 10)
+- `/info` - Show detailed server information
+- `/test` - Test SSH connection
+- `/disconnect` - Disconnect from server and return to manager
+
+## ⌨️ **Interactive Input (SIMPLE)**
+- `!response` - Respond to interactive prompts
+- **Examples:** `!yes`, `!1`, `!mypassword`
+
+## 🤖 **AI Features**
+- Natural language: "install nginx", "check memory usage"
+- AI generates appropriate commands with explanations
+- Automatic sudo detection and password handling
+- Safety validation for dangerous commands
+
+## 📝 **Examples**
+```bash
+# Natural language AI commands
+install docker
+check disk space
+update system packages
+show running processes
+
+# Direct command execution
+$ ls -la /home
+$ top
+$ df -h
+
+# Interactive commands
+/sudo systemctl restart nginx
+/history 5
+/test
+/disconnect
+
+# Interactive input handling (SIMPLE!)
+$ sudo apt install something
+# (when prompted for Y/n)
+!y
+
+$ nano config.txt
+# (when nano opens and waits for content)
+!This is my config content
+```
+
+## 🔄 **Session Management**
+- `/disconnect` - End current SSH session and return to server manager
+
+## ⌨️ **Interactive Commands Workflow (SIMPLE)**
+1. Run a command: `$ nano config.txt`
+2. If it waits for input, you'll see: "Interactive Input Required"
+3. Respond with: `!your_response_here` (NO SPACES after !)
+4. Continue until command completes
+
+💡 **Much easier:** Just use `!` instead of complex commands!"""
+
+        elif base_cmd == "/test":
+            return self.test_connection(server_info)
+
+        elif base_cmd == "/status":
+            return self.show_server_status(server_info)
+
+        elif base_cmd == "/history":
+            limit = 10
+            if len(cmd_parts) > 1:
+                try:
+                    limit = int(cmd_parts[1])
+                    limit = max(1, min(limit, 50))
+                except ValueError:
+                    limit = 10
+            return self.show_history(server_id, limit)
+
+        elif base_cmd == "/info":
+            return self.show_server_info_detailed(server_info)
+
+        elif base_cmd == "/disconnect":
+            return self.disconnect_from_server(server_info)
+
+        elif base_cmd in ["/direct", "/sudo"]:
+            if len(cmd_parts) < 2:
+                return f"❌ Usage: `{base_cmd} <command>`"
+
+            actual_command = " ".join(cmd_parts[1:])
+            if base_cmd == "/sudo" and not actual_command.startswith("sudo"):
+                actual_command = f"sudo {actual_command}"
+
+            return self.execute_direct_command(actual_command, server_info)
+
+        else:
+            return f"""❌ **Unknown command:** `{command}`
+
+Type `/help` to see all available commands.
+
+**Quick commands:**
+- `/status` - Connection status
+- `/test` - Test SSH connection  
+- `/disconnect` - End session
+- `/help` - Full command list
+
+**Interactive input:**
+- `!response` - Reply to prompts (much simpler!)"""
+
+    def test_connection(self, server_info: tuple) -> str:
+        """Test SSH connection"""
+        server_id, name, host, username, model, password_hash = server_info[:6]
+        session_key = f"{server_id}_{username}_{host}"
+
+        if session_key not in self.session_passwords:
+            password = self.decrypt_password(password_hash, server_id)
+        else:
+            password = self.session_passwords[session_key]
+
+        if not password:
+            return f"❌ No password available for {name}"
+
+        try:
+            result = self.execute_ssh_command(
+                server_info, "echo 'SSH test successful'", password
+            )
+
+            if result["success"]:
+                return f"✅ **SSH Connection Test Successful**\n\nServer: {name} ({host})\nOutput: {result.get('output', 'No output')}"
+            else:
+                return f"❌ **SSH Connection Test Failed**\n\nServer: {name} ({host})\nError: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            return f"❌ Connection test failed: {e}"
+
+    def show_server_status(self, server_info: tuple) -> str:
+        """Show server status"""
+        server_id, name, host, username, model = server_info[:5]
+        port = server_info[6] if len(server_info) > 6 else 22
+        session_key = f"{server_id}_{username}_{host}"
+        is_connected = session_key in self.active_sessions
+
+        connection_status = "🟢 Connected" if is_connected else "🟡 Not Connected"
+
+        return f"""📊 **Server Status: {name}**
+
+## 🔗 **Connection**
+- Status: {connection_status}
+- Host: {host}:{port}
+- Username: {username}
+
+## 🤖 **AI Configuration**
+- Model: {model}
+- Auto Execute: {'✅' if self.valves.AUTO_EXECUTE_HIGH_CONFIDENCE else '❌'}
+
+## ⚙️ **Configuration**
+- SSH Timeout: {self.valves.SSH_TIMEOUT}s
+- Ollama URL: {self.valves.OLLAMA_BASE_URL}
+
+💡 **Ready for commands!**"""
+
+    def show_history(self, server_id: str, limit: int = 10) -> str:
+        """Show command history"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.execute(
+                """
+                SELECT command, ai_generated, confidence, success, executed_at
+                FROM command_history 
+                WHERE server_id = ? 
+                ORDER BY executed_at DESC 
+                LIMIT ?
+            """,
+                (server_id, limit),
+            )
+
+            history = cursor.fetchall()
+            conn.close()
+
+            if not history:
+                return "📝 **No command history found**"
+
+            result = f"📝 **Command History (Last {limit})**\n\n"
+            for i, (
+                command,
+                ai_generated,
+                confidence,
+                success,
+                executed_at,
+            ) in enumerate(history, 1):
+                source_icon = "🤖" if ai_generated else "💻"
+                status_icon = "✅" if success else "❌"
+                result += f"**{i}.** {source_icon} {status_icon} `{command}`\n"
+                result += f"    📅 {executed_at}\n\n"
+
+            return result
+
+        except Exception as e:
+            return f"❌ Error retrieving history: {e}"
+
+    def show_server_info_detailed(self, server_info: tuple) -> str:
+        """Show detailed server information"""
+        server_id, name, host, username, model = server_info[:5]
+        port = server_info[6] if len(server_info) > 6 else 22
+        session_key = f"{server_id}_{username}_{host}"
+        is_connected = session_key in self.active_sessions
+
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.execute(
+                "SELECT created_at, last_used FROM servers WHERE id = ?", (server_id,)
+            )
+            dates = cursor.fetchone()
+            conn.close()
+
+            created_at = dates[0] if dates else "Unknown"
+            last_used = dates[1] if dates and dates[1] else "Never"
+
+        except:
+            created_at = "Unknown"
+            last_used = "Unknown"
+
+        connection_status = "🟢 Active" if is_connected else "🔴 Inactive"
+
+        return f"""📋 **Detailed Server Information**
+
+## 🏷️ **Identity**
+- **Name:** {name}
+- **Server ID:** {server_id}
+- **Host:** {host}:{port}
+- **Username:** {username}
+
+## 🔗 **Connection**
+- **Status:** {connection_status}
+- **SSH Timeout:** {self.valves.SSH_TIMEOUT}s
+
+## 🤖 **AI Configuration**
+- **Model:** {model}
+- **Ollama URL:** {self.valves.OLLAMA_BASE_URL}
+- **Auto Execute:** {'Enabled' if self.valves.AUTO_EXECUTE_HIGH_CONFIDENCE else 'Disabled'}
+
+## 📅 **Usage History**
+- **Created:** {created_at}
+- **Last Used:** {last_used}
+
+## 🛠️ **Available Actions**
+- `/test` - Test connection
+- `/history` - View command history
+- `/disconnect` - End session
+"""
+
+    def disconnect_from_server(self, server_info: tuple) -> str:
+        """Disconnect from current server session"""
+        server_id, name, host, username = server_info[:4]
+        session_key = f"{server_id}_{username}_{host}"
+
+        try:
+            # Close SSH connection if active
+            if session_key in self.active_sessions:
+                try:
+                    self.active_sessions[session_key].close()
+                except:
+                    pass
+                del self.active_sessions[session_key]
+
+            # Clean up session password
+            if session_key in self.session_passwords:
+                del self.session_passwords[session_key]
+
+            # Clean up any pending interactive sessions
+            if session_key in self.pending_interactive_sessions:
+                del self.pending_interactive_sessions[session_key]
+
+            # Clean up interactive commands
+            if server_id in self.last_interactive_command:
+                del self.last_interactive_command[server_id]
+
+            return f"""🔌 **Disconnected from {name}**
+
+✅ **Session terminated successfully!**
+
+You are now back in **SSH Manager mode**. The chat context has been reset.
+
+## 🎯 **What you can do now:**
+- **View servers:** `list servers`
+- **Connect directly:** `ssh <server_name>`
+- **Get help:** `help`
+- **Reconnect:** Select a server from the model dropdown
+
+## 🔄 **To reconnect to {name}:**
+1. Type: `ssh {name}` or select **🖥️ {name}** from the model dropdown
+
+💡 **Tip:** Your next message will be processed by the SSH Manager, not the server."""
+
+        except Exception as e:
+            return f"❌ Error disconnecting: {e}"
+
+    def execute_direct_command(self, command: str, server_info: tuple) -> str:
+        """Execute direct command with simple interactive support"""
+        server_id, name = server_info[0], server_info[1]
+
+        if not command.strip():
+            return "❌ Empty command"
+
+        # Security check
+        dangerous_patterns = [r"rm\s+-rf\s+/", r"dd\s+if=.*of=/dev/", r"mkfs\."]
+        for pattern in dangerous_patterns:
+            if re.search(pattern, command, re.IGNORECASE):
+                return f"⚠️ **Dangerous command blocked:** `{command}`\nUse AI assistant for safer alternatives"
+
+        # Get session password
+        session_key = (
+            f"{server_id}_{server_info[3]}_{server_info[2]}"  # server_id_username_host
+        )
+        if session_key not in self.session_passwords:
+            return f"❌ **No active connection to {name}**\n\nPlease connect first: `ssh {name}`"
+
+        password = self.session_passwords[session_key]
+
+        try:
+            result = self.execute_ssh_command(server_info, command, password)
+
+            # Handle interactive prompts
+            if result.get("interaction_required"):
+                # Store the command for later retry
+                self.last_interactive_command[server_id] = command
+
+                return f"""⌨️ **Interactive Input Required on {name}**
+
+**Command:** `{command}`
+
+**Current Output:**
+```
+{result['output']}
+```
+
+**Hint:** {result['prompt_hint']}
+
+🎯 **The command is waiting for your input!**
+
+**How to respond:**
+`!YOUR_RESPONSE_HERE`
+
+**Examples:**
+- `!yes` (for yes/no questions)
+- `!1` (for menu selections)  
+- `!mypassword` (for password prompts)
+- `!/path/to/file` (for file paths)
+
+💡 **Much simpler:** Just type `!` followed by your response!"""
+
+            # Normal command completion
+            self.save_command_history(
+                server_id,
+                command,
+                False,
+                "direct",
+                result["success"],
+                result.get("output", ""),
+            )
+            return self.format_command_result(result, command, name)
+
+        except Exception as e:
+            return f"❌ Command execution failed: {e}"
+
+    def process_natural_language(self, user_input: str, server_info: tuple) -> str:
+        """Process natural language through AI"""
+        server_id, name, host, username, model = server_info[:5]
+        session_key = f"{server_id}_{username}_{host}"
+
+        # Check if we have an active session with password
+        if session_key not in self.session_passwords:
+            return f"❌ **No active connection to {name}**\n\nPlease connect first: `ssh {name}`"
+
+        password = self.session_passwords[session_key]
+
+        result = self.generate_ai_command(user_input, username, model)
+
+        if "error" in result:
+            return f"❌ **AI Generation Failed:** {result['error']}\n\n💡 Try direct command: `$ your-command`"
+
+        command = result["command"]
+        confidence = result.get("confidence", "medium")
+        explanation = result.get("explanation", "")
+        safety = result.get("safety", "caution")
+        requires_sudo = result.get("requires_sudo", False)
+
+        confidence_icon = (
+            "🎯" if confidence == "high" else "⚠️" if confidence == "medium" else "❓"
+        )
+        safety_icon = "✅" if safety == "safe" else "⚠️" if safety == "caution" else "🚨"
+
+        # Add sudo prefix if required for execution
+        execute_command = f"sudo {command}" if requires_sudo else command
+
+        response = f"""🤖 **AI Command for {name}**
+
+**Request:** {user_input}
+
+**Generated Command:**
+```bash
+{command}
+```
+
+**Analysis:**
+{confidence_icon} **Confidence:** {confidence.title()}
+{safety_icon} **Safety:** {safety.title()}
+{"🔐 **Requires:** sudo privileges" if requires_sudo else "👤 **Requires:** user privileges"}
+
+**Explanation:** {explanation}
+"""
+
+        # Auto-execute high confidence safe commands
+        if (
+            confidence == "high"
+            and safety == "safe"
+            and self.valves.AUTO_EXECUTE_HIGH_CONFIDENCE
+        ):
+            response += "\n⚡ **Auto-executing...**\n\n"
+
+            exec_result = self.execute_ssh_command(
+                server_info, execute_command, password
+            )
+
+            # Handle interactive prompts in auto-execution
+            if exec_result.get("interaction_required"):
+                self.last_interactive_command[server_id] = execute_command
+                response += f"""⌨️ **Auto-execution paused - Interactive Input Required**
+
+**Current Output:**
+```
+{exec_result['output']}
+```
+
+**Hint:** {exec_result['prompt_hint']}
+
+**How to respond:** `!YOUR_RESPONSE_HERE`"""
+                return response
+
+            # Normal auto-execution completion
+            self.save_command_history(
+                server_id,
+                execute_command,
+                True,
+                confidence,
+                exec_result["success"],
+                exec_result.get("output", ""),
+            )
+
+            if exec_result["success"]:
+                response += "✅ **Execution Result:**\n"
+                if exec_result["output"]:
+                    output = exec_result["output"]
+                    if len(output) > 1000:
+                        output = output[:1000] + "\n... (truncated)"
+                    response += f"```\n{output}\n```"
+                else:
+                    response += "Command executed successfully"
+            else:
+                response += "❌ **Execution Failed:**\n"
+                if exec_result["error"]:
+                    response += f"```\n{exec_result['error']}\n```"
+        else:
+            response += f"\n💡 **To Execute:** `$ {execute_command}`\n🔧 **Or enable auto-execution in settings**"
+
+        return response
