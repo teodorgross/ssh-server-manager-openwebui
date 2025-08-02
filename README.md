@@ -74,7 +74,8 @@ Configure your servers directly in the Valves settings:
         "username": "admin",
         "password": "secure_password_here",
         "model": "llama3.2",
-        "port": 22
+        "port": 22,
+        "os": "ubuntu 24"
     },
     {
         "name": "webserver",
@@ -82,7 +83,8 @@ Configure your servers directly in the Valves settings:
         "username": "webadmin",
         "password": "web_password_here",
         "model": "gemma2",
-        "port": 2222
+        "port": 2222,
+        "os": "ubuntu 24"
     },
     {
         "name": "development",
@@ -90,7 +92,8 @@ Configure your servers directly in the Valves settings:
         "username": "developer",
         "password": "dev_password_here",
         "model": "llama3.1",
-        "port": 22
+        "port": 22,
+        "os": "ubuntu 24"
     }
 ]
 ```
