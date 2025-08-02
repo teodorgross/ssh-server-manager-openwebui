@@ -2,7 +2,7 @@
 title: 🔧 SSH Server Agent
 author: Teodor Gross
 description: AI-powered SSH server management with interactive sessions
-version: 1.3.2
+version: 1.3.3
 requirements: paramiko, requests
 Github: https://github.com/teodorgross/ssh-server-manager-openwebui
 """
@@ -44,6 +44,7 @@ class ServerConfig(BaseModel):
     password: str = Field(description="SSH password")
     model: str = Field(description="Ollama model to use")
     port: int = Field(default=22, description="SSH port")
+    os: str = Field(description="OS of the remote server")
 
 
 class Pipe:
@@ -51,11 +52,14 @@ class Pipe:
         OLLAMA_BASE_URL: str = Field(
             default="http://localhost:11434/api/chat", description="Ollama API base URL"
         )
+        OLLAMA_TIMEOUT: int = Field(
+            default=60, description="Ollama call timeout in seconds"
+        )
         SSH_TIMEOUT: int = Field(
             default=15, description="SSH connection timeout in seconds"
         )
         COMMAND_TIMEOUT: int = Field(
-            default=30, description="Maximum command execution time in seconds"
+            default=60, description="Maximum command execution time in seconds"
         )
         MAX_CONCURRENT_COMMANDS: int = Field(
             default=3, description="Maximum concurrent SSH commands"
@@ -79,7 +83,8 @@ class Pipe:
         "username": "admin",
         "password": "your_password_here",
         "model": "llama3.2",
-        "port": 22
+        "port": 22,
+        "os": "redhat 8"
     },
     {
         "name": "development",
@@ -87,7 +92,8 @@ class Pipe:
         "username": "dev",
         "password": "dev_password_here",
         "model": "gemma2",
-        "port": 22
+        "port": 22,
+        "os": "ubuntu 24"
     }
 ]""",
             description="JSON array of server configurations. Example structure provided above.",
@@ -102,7 +108,7 @@ class Pipe:
         self.command_threads = {}  # Track running command threads
         self.thread_pool = ThreadPoolExecutor(max_workers=5)
         self.stop_flags = {}  # Flags to signal thread termination
-        self.current_version = "1.3.2"  # Current version
+        self.current_version = "1.3.3"  # Current version
         self.version_check_url = "https://raw.githubusercontent.com/teodorgross/ssh-server-manager-openwebui/refs/heads/main/version"
         self.github_url = "https://github.com/teodorgross/ssh-server-manager-openwebui"
         self.last_update_check = None
@@ -140,8 +146,8 @@ class Pipe:
 
                 conn.execute(
                     """INSERT INTO servers 
-                       (id, name, host, username, model, port) 
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                       (id, name, host, username, model, port, os) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         server_id,
                         server["name"],
@@ -149,6 +155,7 @@ class Pipe:
                         server["username"],
                         server["model"],
                         server.get("port", 22),
+                        server["os"],
                     ),
                 )
 
@@ -240,6 +247,7 @@ class Pipe:
                             username TEXT,
                             model TEXT,
                             port INTEGER DEFAULT 22,
+                            os TEXT,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             last_used TIMESTAMP
                         )
@@ -258,6 +266,48 @@ class Pipe:
                     conn.execute("ALTER TABLE servers_new RENAME TO servers")
                     print("Database migration completed: passwords removed")
 
+                if "os" not in columns:
+                    print("Migrating database: adding os column.")
+
+                    conn.execute("DROP TABLE IF EXISTS servers_new")
+
+                    conn.execute(
+                        """
+                        CREATE TABLE servers_new (
+                            id TEXT PRIMARY KEY,
+                            name TEXT UNIQUE,
+                            host TEXT,
+                            username TEXT,
+                            model TEXT,
+                            port INTEGER DEFAULT 22,
+                            os TEXT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_used TIMESTAMP
+                        )
+                    """
+                    )
+
+                    conn.execute(
+                        """
+                        INSERT INTO servers_new (id, name, host, username, model, port, created_at, last_used)
+                        SELECT id, name, host, username, model, port, created_at, last_used
+                        FROM servers
+                    """
+                    )
+
+                    conn.execute(
+                        """
+                        UPDATE servers_new
+                        SET os = "redhat 8"
+                    """
+                    )
+
+                    conn.execute("DROP TABLE servers")
+                    conn.execute("ALTER TABLE servers_new RENAME TO servers")
+                    print(
+                        "Database migration completed: os added (default to redhat 8)"
+                    )
+
             except Exception as e:
                 print(f"Migration note: {e}")
 
@@ -270,6 +320,7 @@ class Pipe:
                     username TEXT,
                     model TEXT,
                     port INTEGER DEFAULT 22,
+                    os TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_used TIMESTAMP
                 )
@@ -395,7 +446,7 @@ class Pipe:
 
             conn = sqlite3.connect(self.db_file)
             cursor = conn.execute(
-                "SELECT id, name, host, username, model FROM servers ORDER BY name"
+                "SELECT id, name, host, username, model, os FROM servers ORDER BY name"
             )
             servers = cursor.fetchall()
             conn.close()
@@ -409,18 +460,25 @@ class Pipe:
         except Exception as e:
             return [{"id": "ssh-error", "name": f"❌ SSH Error: {str(e)}"}]
 
-    def call_ollama(self, prompt: str, model: str) -> Optional[str]:
+    def call_ollama(
+        self, prompt: str, model: str, system_message: str
+    ) -> Optional[str]:
         """Call Ollama API"""
         try:
             payload = {
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": system_message},
+                ],
                 "stream": False,
             }
 
             if HTTP_AVAILABLE:
                 response = requests.post(
-                    self.valves.OLLAMA_BASE_URL, json=payload, timeout=30
+                    self.valves.OLLAMA_BASE_URL,
+                    json=payload,
+                    timeout=self.valves.OLLAMA_TIMEOUT,
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -1696,7 +1754,7 @@ class Pipe:
                     generated_id == server_id
                     or server["name"].lower() == server_id.lower()
                 ):
-                    # Return tuple in expected format: (id, name, host, username, model, password_placeholder, port)
+                    # Return tuple in expected format: (id, name, host, username, model, password_placeholder, port, os)
                     server_tuple = (
                         generated_id,  # server_id
                         server["name"],  # name
@@ -1705,6 +1763,7 @@ class Pipe:
                         server["model"],  # model
                         None,  # password_placeholder (not used anymore)
                         server.get("port", 22),  # port
+                        server["os"],  # OS
                     )
                     print(f"DEBUG: Found server from valves: {server_tuple}")
                     return server_tuple
@@ -1865,6 +1924,7 @@ class Pipe:
                         server["model"],  # model
                         None,  # password_placeholder
                         server.get("port", 22),  # port
+                        server["os"],  # OS
                     )
 
             return None
@@ -1973,7 +2033,8 @@ Edit the **SERVERS** setting in the valves and add your server configurations.
         "username": "admin",
         "password": "your_password_here",
         "model": "llama3.2",
-        "port": 22
+        "port": 22,
+        "os": "redhat 8"
     }
 ]
 ```"""
@@ -1983,6 +2044,7 @@ Edit the **SERVERS** setting in the valves and add your server configurations.
                 result += f"**🟢 {server['name']}**\n"
                 result += f"  📍 Host: {server['host']}:{server.get('port', 22)}\n"
                 result += f"  👤 User: {server['username']}\n"
+                result += f"  ⚙️ OS: {server['os']}\n"
                 result += f"  🤖 Model: {server['model']}\n\n"
 
             result += "💡 **Usage:** `ssh <server_name>` or select from model dropdown"
@@ -2052,7 +2114,8 @@ Servers are configured directly in the pipe settings (Valves):
         "username": "admin", 
         "password": "secure_password",
         "model": "llama3.2",
-        "port": 22
+        "port": 22,
+        "os": "redhat 8"
     },
     {
         "name": "webserver",
@@ -2060,7 +2123,8 @@ Servers are configured directly in the pipe settings (Valves):
         "username": "www-data",
         "password": "web_password",
         "model": "gemma2",
-        "port": 2222
+        "port": 2222,
+        "os": "ubuntu 24"
     }
 ]
 ```"""
@@ -2106,6 +2170,7 @@ Servers are configured directly in the pipe settings (Valves):
                 "password": "your_password_here",
                 "model": "llama3.2",
                 "port": 22,
+                "os": "redhat 8",
             },
             {
                 "name": "development",
@@ -2114,6 +2179,7 @@ Servers are configured directly in the pipe settings (Valves):
                 "password": "dev_password_here",
                 "model": "gemma2",
                 "port": 22,
+                "os": "ubuntu 24",
             },
         ]
 
@@ -2138,7 +2204,7 @@ Servers are configured directly in the pipe settings (Valves):
         return False
 
     def generate_ai_command(
-        self, user_request: str, username: str, model: str
+        self, user_request: str, username: str, model: str, server_os: str
     ) -> Dict[str, Any]:
         """Generate AI command"""
 
@@ -2155,6 +2221,8 @@ Servers are configured directly in the pipe settings (Valves):
             "alles klar",
             "sup",
             "yo",
+            "bonjour",
+            "salut",
         ]
 
         if any(pattern in user_request.lower() for pattern in casual_patterns):
@@ -2166,16 +2234,14 @@ Servers are configured directly in the pipe settings (Valves):
                 "safety": "safe",
             }
 
-        prompt = f"""You are an expert Linux system administrator. Generate a safe command for this request.
+        system_message = f"""You are an expert Linux system administrator on {server_os}. Generate a safe command for this request.
 
 IMPORTANT INSTRUCTIONS:
 - The user '{username}' is NOT root by default
 - For commands that require sudo privileges, use the sudo prefix instead of adding sudo to the command
 - Only use regular command if you're certain it doesn't need elevated privileges
 - Be conservative: if unsure, use sudo prefix
-
-User: {username}
-Request: {user_request}
+- Only give commands that are compatible with the OS, which is {server_os} .
 
 COMMAND FORMAT RULES:
 - If command needs root privileges: use "sudo command"
@@ -2183,7 +2249,11 @@ COMMAND FORMAT RULES:
 - Examples of commands that typically need sudo: package installation, system service management, editing system files, mounting drives
 - Examples of commands that use: ls, ps, df, cat (reading files), cd, grep, find (in user directories)
 
-Respond with JSON only:
+"""
+
+        prompt = f"""user request: {user_request} . It must be compatible with OS : {server_os}.
+
+        Respond with JSON only:
 {{
     "command": "exact command with proper prefix (sudo or $ only)",
     "confidence": "high|medium|low",
@@ -2192,15 +2262,13 @@ Respond with JSON only:
     "safety": "safe|caution|dangerous"
 }}
 
-Examples:
-- "check disk space": {{"command": "$ df -h", "confidence": "high", "explanation": "Shows disk usage - no privileges needed", "requires_sudo": false, "safety": "safe"}}
-- "install nginx": {{"command": "sudo apt update && apt install -y nginx", "confidence": "high", "explanation": "Installs nginx web server - requires root privileges", "requires_sudo": true, "safety": "safe"}}
-- "restart apache": {{"command": "sudo systemctl restart apache2", "confidence": "high", "explanation": "Restarts Apache service - requires root privileges", "requires_sudo": true, "safety": "safe"}}
-- "list files": {{"command": "$ ls -la", "confidence": "high", "explanation": "Lists files in current directory - no privileges needed", "requires_sudo": false, "safety": "safe"}}
+       Return ONLY the JSON, no other text. 
+        """
 
-Return ONLY the JSON, no other text."""
+        print(f"DEBUG: system message = '{system_message}'")
+        print(f"DEBUG: prompt message = '{prompt}'")
 
-        ai_response = self.call_ollama(prompt, model)
+        ai_response = self.call_ollama(prompt, model, system_message)
         if not ai_response or ai_response.startswith("❌"):
             return {"error": ai_response or "AI service unavailable"}
 
@@ -2280,9 +2348,16 @@ Return ONLY the JSON, no other text."""
     def connect_to_server(self, server_info: tuple) -> str:
         """Auto-connect to server using valves configuration"""
         try:
-            server_id, name, host, username, model, password_placeholder, port = (
-                server_info[:7]
-            )
+            (
+                server_id,
+                name,
+                host,
+                username,
+                model,
+                password_placeholder,
+                port,
+                server_os,
+            ) = server_info[:8]
             if len(server_info) < 7:
                 port = 22
 
@@ -2314,6 +2389,7 @@ Return ONLY the JSON, no other text."""
 📍 **Server:** {host}:{port}
 👤 **User:** {username}  
 🤖 **Model:** {model}
+⚙️ **OS:** {server_os}
 🔐 **Security:** Password loaded from Valves (not stored in database)
 
 ## 🎯 **You can now use:**
@@ -2811,6 +2887,7 @@ You are now back in **SSH Manager mode**. The chat context has been reset.
     def process_natural_language(self, user_input: str, server_info: tuple) -> str:
         """Process natural language through AI"""
         server_id, name, host, username, model = server_info[:5]
+        server_os = server_info[7]
         session_key = f"{server_id}_{username}_{host}"
 
         # Check if we have an active session with password
@@ -2819,7 +2896,7 @@ You are now back in **SSH Manager mode**. The chat context has been reset.
 
         password = self.session_passwords[session_key]
 
-        result = self.generate_ai_command(user_input, username, model)
+        result = self.generate_ai_command(user_input, username, model, server_os)
 
         if "error" in result:
             return f"❌ **AI Generation Failed:** {result['error']}\n\n💡 Try direct command: `$ your-command`"
