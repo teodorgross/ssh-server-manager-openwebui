@@ -69,7 +69,7 @@ Configure your servers directly in the Valves settings:
 ```json
 [
     {
-        "name": "production",
+        "name": "testserver",
         "host": "192.168.1.100",
         "username": "admin",
         "password": "secure_password_here",
@@ -78,7 +78,7 @@ Configure your servers directly in the Valves settings:
         "os": "ubuntu 24"
     },
     {
-        "name": "webserver",
+        "name": "testserver2",
         "host": "web.example.com",
         "username": "webadmin",
         "password": "web_password_here",
